@@ -167,7 +167,7 @@ void photo_save(const char *fileName) {
   int64_t t_led_on = esp_timer_get_time();
 
   // 1) LED 預熱（讓曝光穩定）
-  setLEDBrightness(60);
+  setLEDBrightness(50);
   delay(120);
 
   // 2) 丟棄第一幀（避免未穩定畫面）
@@ -250,7 +250,7 @@ void setup() {
   config.pin_pwdn  = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
 
-  config.xclk_freq_hz = 15000000;            // 10 MHz：穩定
+  config.xclk_freq_hz = 5000000;            // 10 MHz：穩定
   config.frame_size   = FRAMESIZE_QSXGA;     // 有 PSRAM 時可用
   config.pixel_format = PIXFORMAT_JPEG;
   config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
@@ -282,6 +282,15 @@ void setup() {
   // 可依場景把 AE/AWB 鎖住以提升一致性
   sensor_t *s = esp_camera_sensor_get();
   s->set_wb_mode(s, 1);
+  //s->set_gain_ctrl(s, 0);      // 關自動增益
+  //s->set_exposure_ctrl(s, 0);  // 關自動曝光
+  //s->set_aec_value(s, 600);    // 固定曝光值，可調 400~800 視亮度
+  //s->set_agc_gain(s, 8);       // 固定增益，可調 5~12
+  //s->set_brightness(s, 1);     // 提亮
+  //s->set_contrast(s, 1);       // 增加對比
+  //s->set_whitebal(s, 0);       // 關自動白平衡
+
+
 
   // ===== 掛載 SD（多時脈嘗試）=====
   if (!sd_init_fast()) {
