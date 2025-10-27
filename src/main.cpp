@@ -108,7 +108,7 @@ void photo_save(const char *filePath) {
 
   // 2) 丟 2 幀（確保下一幀的曝光起點在 LED 穩定後）
   discard_one_frame();
-  //discard_one_frame();
+  discard_one_frame();
 
   // 3) 正式取幀
   camera_fb_t *fb = esp_camera_fb_get();
@@ -182,7 +182,7 @@ void setup() {
   config.pin_reset = RESET_GPIO_NUM;
 
   config.xclk_freq_hz = XCLK_FREQ_HZ;
-  config.frame_size   = FRAMESIZE_FHD;    // 需要更穩就先降 UXGA/SXGA
+  config.frame_size   = FRAMESIZE_UXGA;    // 需要更穩就先降 UXGA/SXGA FRAMESIZE_QSXGA
   config.pixel_format = PIXFORMAT_JPEG;
   config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY; // 等待下一幀（避免舊幀）
   config.fb_location  = CAMERA_FB_IN_PSRAM;
