@@ -15,11 +15,11 @@
 #include "camera_pins.h"
 
 // ===== 參數 =====
-#define TARGET_PERIOD_S   5         // 週期（秒）
+#define TARGET_PERIOD_S   10         // 週期（秒）
 #define LED_PIN           D1        // 補光 LED 腳位
 #define SD_CS             21        // SD CS 腳位
-#define BUCKET_SIZE       1000      // 每個資料夾最多檔案數
-#define XCLK_FREQ_HZ      10000000   // 10 MHz（穩；可視情況試 20 MHz）
+#define BUCKET_SIZE       500      // 每個資料夾最多檔案數
+#define XCLK_FREQ_HZ      5000000   // 5 MHz（穩；可視情況試 20 MHz）
 #define LED_PREHEAT_MS    200       // LED 預熱
 #define LED_BRIGHTNESS    60        // LED 亮度（0~255）
 
@@ -182,7 +182,7 @@ void setup() {
   config.pin_reset = RESET_GPIO_NUM;
 
   config.xclk_freq_hz = XCLK_FREQ_HZ;
-  config.frame_size   = FRAMESIZE_UXGA;    // 需要更穩就先降 UXGA/SXGA FRAMESIZE_QSXGA
+  config.frame_size   = FRAMESIZE_QSXGA;    // 需要更穩就先降 UXGA/SXGA FRAMESIZE_QSXGA
   config.pixel_format = PIXFORMAT_JPEG;
   config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY; // 等待下一幀（避免舊幀）
   config.fb_location  = CAMERA_FB_IN_PSRAM;
@@ -205,6 +205,26 @@ void setup() {
   //s->set_aec_value(s, 400);   // 依 LED 亮度調 400~800
   //s->set_gain_ctrl(s, 0);
   //s->set_agc_gain(s, 8);      // 5~12 常見
+  s->set_brightness(s, 0);     // -2 to 2
+  s->set_contrast(s, 2);       // -2 to 2
+  s->set_saturation(s, 1);     // -2 to 2
+  s->set_special_effect(s, 0); // 0 to 6 (0 - No Effect, 1 - Negative, 2 - Grayscale, 3 - Red Tint, 4 - Green Tint, 5 - Blue Tint, 6 - Sepia)
+  s->set_whitebal(s, 1);       // 0 = disable , 1 = enable
+  s->set_awb_gain(s, 1);       // 0 = disable , 1 = enable
+  //s->set_wb_mode(s, 0);        // 0 to 4 - if awb_gain enabled (0 - Auto, 1 - Sunny, 2 - Cloudy, 3 - Office, 4 - Home)
+  s->set_exposure_ctrl(s, 1);  // 0 = disable , 1 = enable
+  s->set_aec2(s, 0);           // 0 = disable , 1 = enable
+  s->set_ae_level(s, 0);       // -2 to 2
+  s->set_aec_value(s, 300);    // 0 to 1200
+  s->set_gain_ctrl(s, 1);      // 0 = disable , 1 = enable
+  s->set_agc_gain(s, 0);       // 0 to 30
+  s->set_gainceiling(s, (gainceiling_t)0);  // 0 to 6
+  s->set_bpc(s, 0);            // 0 = disable , 1 = enable
+  s->set_wpc(s, 1);            // 0 = disable , 1 = enable
+  s->set_raw_gma(s, 1);        // 0 = disable , 1 = enable
+  s->set_lenc(s, 1);           // 0 = disable , 1 = enable
+  s->set_dcw(s, 1);            // 0 = disable , 1 = enable
+  s->set_colorbar(s, 0);       // 0 = disable , 1 = enable
 
   // 掛載 SD（多時脈嘗試）
   if (!sd_init_fast()) {
