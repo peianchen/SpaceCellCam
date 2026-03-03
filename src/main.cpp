@@ -21,7 +21,7 @@
 #define BUCKET_SIZE       500      // 每個資料夾最多檔案數
 #define XCLK_FREQ_HZ      5000000   // 5 MHz（穩；可視情況試 20 MHz）
 #define LED_PREHEAT_MS    200       // LED 預熱
-#define LED_BRIGHTNESS    60        // LED 亮度（0~255）
+#define LED_BRIGHTNESS    5        // LED 亮度（0~255）
 
 // ===== SdFat 物件 =====
 SdFat32 sd;
