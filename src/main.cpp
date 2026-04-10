@@ -18,6 +18,7 @@
 #include "SPI.h"
 #include "esp_timer.h"
 #include <SdFat.h>
+#include "ov5640_af_support.h"
 
 // ===== 相機腳位（Seeed XIAO ESP32S3）=====
 #ifndef CAMERA_MODEL_XIAO_ESP32S3
@@ -33,6 +34,10 @@
 #define XCLK_FREQ_HZ      5000000    // 5 MHz（穩；可視情況試 20 MHz）
 #define LED_PREHEAT_MS    200        // LED 預熱
 #define LED_BRIGHTNESS    10         // LED 亮度（0~255）
+#define ENABLE_AUTOFOCUS  1          // 只在 OV5640 + AF 模組時生效
+#define AF_SETUP_SETTLE_MS 1500      // setup 時給 AF 收斂的時間
+#define AF_POLL_MS        50         // setup 時輪詢 AF 狀態間隔
+#define AF_STABLE_COUNT   3          // 連續幾次穩定才視為已對焦
 
 // ===== 曝光/增益模式切換 =====
 #define EXPOSURE_MODE     0          // 0=自動  1=固定（建議量測一致性）
@@ -53,6 +58,9 @@ static const int LEDC_LED_RES   = 8;
 SdFat32 sd;
 File32  file;
 uint32_t g_sd_hz = 0;
+bool g_af_supported = false;
+bool g_af_ready = false;
+bool g_sd_ready = false;
 
 // ===== 計數（照片序號）=====
 int imgCount = 0;
@@ -74,6 +82,7 @@ bool sd_begin_mhz(uint32_t mhz) {
   SdSpiConfig cfg(SD_CS, SHARED_SPI, SD_SCK_MHZ(mhz));
   if (sd.begin(cfg)) {
     g_sd_hz = mhz * 1000000UL;
+    g_sd_ready = true;
     Serial.printf("[SD] mounted at %u MHz\n", (unsigned)mhz);
     return true;
   }
@@ -84,6 +93,7 @@ bool sd_init_fast() {
   for (size_t i=0;i<sizeof(cand_mhz)/sizeof(cand_mhz[0]);++i) {
     if (sd_begin_mhz(cand_mhz[i])) return true;
   }
+  g_sd_ready = false;
   return false;
 }
 
@@ -91,6 +101,69 @@ bool sd_init_fast() {
 static inline void discard_one_frame() {
   camera_fb_t *fb = esp_camera_fb_get();
   if (fb) esp_camera_fb_return(fb);
+}
+
+static bool autofocusReachedStableState(uint32_t timeout_ms) {
+  const uint32_t start = millis();
+  int stable_count = 0;
+
+  while ((millis() - start) < timeout_ms) {
+    const int status = ov5640_af_status();
+    if (status == 0x10 || status == 0x70) {
+      if (++stable_count >= AF_STABLE_COUNT) {
+        return true;
+      }
+    } else if (status < 0) {
+      return false;
+    } else {
+      stable_count = 0;
+    }
+    delay(AF_POLL_MS);
+  }
+
+  return false;
+}
+
+static void initAutofocus(sensor_t *s) {
+#if ENABLE_AUTOFOCUS
+  g_af_supported = ov5640_af_supported(s);
+  if (!g_af_supported) {
+    Serial.printf("[AF] unsupported sensor PID=0x%04X\n", s ? s->id.PID : 0);
+    return;
+  }
+
+  Serial.printf("[AF] OV5640 AF library available: %s\n",
+                ov5640_af_library_available() ? "yes" : "no");
+  if (!ov5640_af_begin(s)) {
+    Serial.printf("[AF] init failed, focusInit=%d\n", ov5640_af_init_result());
+    Serial.println("[AF] Check whether the camera module actually has AF/VCM power.");
+    return;
+  }
+
+  g_af_ready = true;
+  Serial.printf("[AF] firmware ready, status=%d\n", ov5640_af_status());
+
+  setLEDBrightness(LED_BRIGHTNESS);
+  delay(LED_PREHEAT_MS);
+  if (ov5640_af_enable_continuous()) {
+    Serial.println("[AF] continuous autofocus enabled");
+  } else {
+    Serial.println("[AF] continuous autofocus start failed");
+  }
+  if (autofocusReachedStableState(AF_SETUP_SETTLE_MS)) {
+    Serial.printf("[AF] stable focus reached, status=%d\n", ov5640_af_status());
+  } else {
+    Serial.printf("[AF] focus did not stabilize in time, status=%d\n", ov5640_af_status());
+  }
+  if (ov5640_af_stop()) {
+    Serial.println("[AF] focus locked");
+  } else {
+    Serial.println("[AF] focus lock command failed");
+  }
+  setLEDBrightness(0);
+#else
+  (void)s;
+#endif
 }
 
 // ---------- 分桶資料夾 ----------
@@ -102,6 +175,99 @@ static bool sd_ensure_dir(const char* path) {
   }
   Serial.printf("[SD] mkdir failed: %s\n", path);
   return false;
+}
+
+static bool remountSdCard() {
+  sd.end();
+  g_sd_ready = false;
+  Serial.println("[SD] remounting...");
+  if (!sd_init_fast()) {
+    Serial.println("[SD] remount failed");
+    return false;
+  }
+  return true;
+}
+
+static bool parseBucketNumber(const char *name, int *bucket) {
+  if (!name || !bucket) return false;
+  if (strlen(name) != 4 || name[0] != 'b') return false;
+  if (!isdigit((unsigned char)name[1]) || !isdigit((unsigned char)name[2]) || !isdigit((unsigned char)name[3])) return false;
+  *bucket = (name[1] - '0') * 100 + (name[2] - '0') * 10 + (name[3] - '0');
+  return true;
+}
+
+static bool parseImageNumber(const char *name, int *number) {
+  if (!name || !number) return false;
+  if (strncmp(name, "image_", 6) != 0) return false;
+  const char *ext = strstr(name, ".jpg");
+  if (!ext || ext == name + 6 || ext[4] != '\0') return false;
+
+  int value = 0;
+  for (const char *p = name + 6; p < ext; ++p) {
+    if (!isdigit((unsigned char)*p)) return false;
+    value = value * 10 + (*p - '0');
+  }
+  *number = value;
+  return true;
+}
+
+static void recoverImageCounter() {
+  int last_bucket = -1;
+  FsFile dir;
+
+  if (!dir.open("/")) {
+    Serial.println("[SD] root open failed, start counter at 0");
+    imgCount = 0;
+    return;
+  }
+
+  FsFile entry;
+  while (entry.openNext(&dir, O_RDONLY)) {
+    if (entry.isDir()) {
+      char name[32];
+      if (entry.getName(name, sizeof(name))) {
+        int bucket = -1;
+        if (parseBucketNumber(name, &bucket) && bucket > last_bucket) {
+          last_bucket = bucket;
+        }
+      }
+    }
+    entry.close();
+  }
+  dir.close();
+
+  if (last_bucket < 0) {
+    imgCount = 0;
+    Serial.println("[SD] no previous images found");
+    return;
+  }
+
+  char folder[32];
+  snprintf(folder, sizeof(folder), "/b%03d", last_bucket);
+
+  int max_number = 0;
+  if (!dir.open(folder)) {
+    Serial.printf("[SD] open last bucket failed: %s\n", folder);
+    imgCount = last_bucket * BUCKET_SIZE;
+    return;
+  }
+
+  while (entry.openNext(&dir, O_RDONLY)) {
+    if (entry.isFile()) {
+      char name[64];
+      if (entry.getName(name, sizeof(name))) {
+        int number = 0;
+        if (parseImageNumber(name, &number) && number > max_number) {
+          max_number = number;
+        }
+      }
+    }
+    entry.close();
+  }
+  dir.close();
+
+  imgCount = max_number;
+  Serial.printf("[SD] recovered image counter: %d (next: %d)\n", imgCount, imgCount + 1);
 }
 
 // ---------- Atomic 寫入 + 驗證 ----------
@@ -234,6 +400,11 @@ static void applyExposureMode(sensor_t *s) {
 
 // ---------- 拍照 + 存檔（LED 先穩定，丟 2 幀再拍） ----------
 void photo_save(const char *filePath) {
+  if (!g_sd_ready && !remountSdCard()) {
+    Serial.println("[SD] unavailable, skip capture save");
+    return;
+  }
+
   int64_t t_led_on = esp_timer_get_time();
 
   // 1) LED 預熱與穩定
@@ -265,9 +436,11 @@ void photo_save(const char *filePath) {
   bool ok = atomicWriteAndVerify(filePath, fb->buf, img_len, &write_ms, &write_mbps);
   if (!ok) {
     Serial.println("[SD] write+verify failed, remount slower and retry once...");
-    sd.end();
-    if (sd_begin_mhz(20) || sd_begin_mhz(16) || sd_begin_mhz(12)) {
+    if (remountSdCard()) {
       ok = atomicWriteAndVerify(filePath, fb->buf, img_len, &write_ms, &write_mbps);
+    }
+    if (!ok) {
+      g_sd_ready = false;
     }
   }
 
@@ -338,12 +511,15 @@ void setup() {
   // 套用曝光/增益模式
   sensor_t *s = esp_camera_sensor_get();
   applyExposureMode(s);
+  initAutofocus(s);
 
   // 掛載 SD（多時脈嘗試）
   if (!sd_init_fast()) {
     Serial.println("[SD] mount failed (all speeds tried).");
     while (true) { delay(1000); }
   }
+
+  recoverImageCounter();
 
   Serial.println("Continuous mode: capture (no sleep).");
 }
