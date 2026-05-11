@@ -34,10 +34,20 @@
 #define XCLK_FREQ_HZ      5000000    // 5 MHz（穩；可視情況試 20 MHz）
 #define LED_PREHEAT_MS    200        // LED 預熱
 #define LED_BRIGHTNESS    10         // LED 亮度（0~255）
+#define STATUS_LED_BRIGHTNESS 80     // 不接Serial時用補光LED顯示狀態
 #define ENABLE_AUTOFOCUS  1          // 只在 OV5640 + AF 模組時生效
+#define AF_LOCK_MODE      1          // 0=關AF  1=setup後stop鎖焦  2=setup後release  3=每張短暫AF後release
 #define AF_SETUP_SETTLE_MS 1500      // setup 時給 AF 收斂的時間
+#define AF_CAPTURE_SETTLE_MS 700     // 每張短暫AF最多等待時間，避免拖垮10秒週期
 #define AF_POLL_MS        50         // setup 時輪詢 AF 狀態間隔
 #define AF_STABLE_COUNT   3          // 連續幾次穩定才視為已對焦
+#define AF_CENTER_X       30         // OV5640 AF grid: 0~79
+#define AF_CENTER_Y       22         // OV5640 AF grid: 0~59
+#define AF_CENTER_W       20
+#define AF_CENTER_H       16
+#define AWB_WARMUP_FRAMES 8          // 開機時在LED光源下讓AWB收斂的幀數
+#define WB_MODE           0          // 0=Auto  1=Sunny  2=Cloudy  3=Office  4=Home
+#define ENABLE_AWB_LOCK   0          // 0=持續自動白平衡；1=warmup後鎖定
 
 // ===== 曝光/增益模式切換 =====
 #define EXPOSURE_MODE     0          // 0=自動  1=固定（建議量測一致性）
@@ -75,6 +85,22 @@ static inline void led_init() {
 
 static inline void setLEDBrightness(uint8_t b) {
   ledcWrite(LEDC_LED_CH, b);
+}
+
+static void statusBlink(uint8_t count) {
+  for (uint8_t i = 0; i < count; ++i) {
+    setLEDBrightness(STATUS_LED_BRIGHTNESS);
+    delay(120);
+    setLEDBrightness(0);
+    delay(120);
+  }
+}
+
+static void fatalBlinkLoop(uint8_t count) {
+  while (true) {
+    statusBlink(count);
+    delay(1000);
+  }
 }
 
 // ---------- SD 掛載 ----------
@@ -125,7 +151,7 @@ static bool autofocusReachedStableState(uint32_t timeout_ms) {
 }
 
 static void initAutofocus(sensor_t *s) {
-#if ENABLE_AUTOFOCUS
+#if ENABLE_AUTOFOCUS && (AF_LOCK_MODE != 0)
   g_af_supported = ov5640_af_supported(s);
   if (!g_af_supported) {
     Serial.printf("[AF] unsupported sensor PID=0x%04X\n", s ? s->id.PID : 0);
@@ -143,8 +169,19 @@ static void initAutofocus(sensor_t *s) {
   g_af_ready = true;
   Serial.printf("[AF] firmware ready, status=%d\n", ov5640_af_status());
 
+#if AF_LOCK_MODE == 3
+  Serial.println("[AF] per-capture autofocus enabled");
+#else
   setLEDBrightness(LED_BRIGHTNESS);
   delay(LED_PREHEAT_MS);
+
+  if (ov5640_af_focus_zone(AF_CENTER_X, AF_CENTER_Y, AF_CENTER_W, AF_CENTER_H)) {
+    Serial.printf("[AF] center focus zone x=%d y=%d w=%d h=%d\n",
+                  AF_CENTER_X, AF_CENTER_Y, AF_CENTER_W, AF_CENTER_H);
+  } else {
+    Serial.println("[AF] center focus zone setup failed, fallback to continuous AF");
+  }
+
   if (ov5640_af_enable_continuous()) {
     Serial.println("[AF] continuous autofocus enabled");
   } else {
@@ -152,17 +189,56 @@ static void initAutofocus(sensor_t *s) {
   }
   if (autofocusReachedStableState(AF_SETUP_SETTLE_MS)) {
     Serial.printf("[AF] stable focus reached, status=%d\n", ov5640_af_status());
+#if AF_LOCK_MODE == 2
+    if (ov5640_af_release()) {
+      Serial.println("[AF] focus released (VCM heat test mode)");
+    } else {
+      Serial.println("[AF] focus release command failed");
+    }
+#else
     if (ov5640_af_stop()) {
       Serial.println("[AF] focus locked");
     } else {
       Serial.println("[AF] focus lock command failed");
     }
+#endif
   } else {
     Serial.printf("[AF] WARNING: focus did not stabilize in time, status=%d — not locking\n", ov5640_af_status());
   }
   setLEDBrightness(0);
+#endif
 #else
   (void)s;
+  Serial.println("[AF] disabled by config");
+#endif
+}
+
+static bool runCaptureAutofocus() {
+#if ENABLE_AUTOFOCUS && (AF_LOCK_MODE == 3)
+  if (!g_af_ready) return false;
+
+  if (!ov5640_af_trigger_single()) {
+    Serial.println("[AF] per-capture start failed");
+    return false;
+  }
+  if (!autofocusReachedStableState(AF_CAPTURE_SETTLE_MS)) {
+    Serial.printf("[AF] per-capture did not stabilize, status=%d\n", ov5640_af_status());
+    return false;
+  }
+  if (ov5640_af_stop()) {
+    Serial.println("[AF] per-capture focused");
+  }
+  return true;
+#else
+  return false;
+#endif
+}
+
+static void releaseCaptureAutofocus() {
+#if ENABLE_AUTOFOCUS && (AF_LOCK_MODE == 3)
+  if (g_af_ready && ov5640_af_release()) {
+    Serial.println("[AF] per-capture released");
+  }
 #endif
 }
 
@@ -213,15 +289,15 @@ static bool parseImageNumber(const char *name, int *number) {
 
 static void recoverImageCounter() {
   int last_bucket = -1;
-  FsFile dir;
+  File32 dir = sd.open("/", O_RDONLY);
 
-  if (!dir.open("/")) {
+  if (!dir || !dir.isDir()) {
     Serial.println("[SD] root open failed, start counter at 0");
     imgCount = 0;
     return;
   }
 
-  FsFile entry;
+  File32 entry;
   while (entry.openNext(&dir, O_RDONLY)) {
     if (entry.isDir()) {
       char name[32];
@@ -246,7 +322,8 @@ static void recoverImageCounter() {
   snprintf(folder, sizeof(folder), "/b%03d", last_bucket);
 
   int max_number = 0;
-  if (!dir.open(folder)) {
+  dir = sd.open(folder, O_RDONLY);
+  if (!dir || !dir.isDir()) {
     Serial.printf("[SD] open last bucket failed: %s\n", folder);
     imgCount = (last_bucket + 1) * BUCKET_SIZE;
     return;
@@ -350,7 +427,7 @@ static void applyExposureMode(sensor_t *s) {
   // ===== 自動曝光/增益 =====
   s->set_whitebal(s, 1);
   s->set_awb_gain(s, 1);
-  s->set_wb_mode(s, 1);
+  s->set_wb_mode(s, WB_MODE);
 
   s->set_exposure_ctrl(s, 1); // Auto exposure
   s->set_aec2(s, 0);
@@ -365,7 +442,7 @@ static void applyExposureMode(sensor_t *s) {
   // 白平衡可選擇 auto（一般穩）或固定；這裡保留 auto WB
   s->set_whitebal(s, 1);
   s->set_awb_gain(s, 1);
-  s->set_wb_mode(s, 1);
+  s->set_wb_mode(s, WB_MODE);
 
   // 關閉自動曝光/增益
   s->set_exposure_ctrl(s, 0); // Manual exposure
@@ -380,8 +457,8 @@ static void applyExposureMode(sensor_t *s) {
 
   // 其他畫質參數（保留你原本的設定）
   s->set_brightness(s, 0);     // -2 to 2
-  s->set_contrast(s, 2);       // -2 to 2
-  s->set_saturation(s, 1);     // -2 to 2
+  s->set_contrast(s, 0);       // -2 to 2
+  s->set_saturation(s, 0);     // -2 to 2
   s->set_special_effect(s, 0); // 0~6
   s->set_bpc(s, 0);
   s->set_wpc(s, 1);
@@ -398,6 +475,30 @@ static void applyExposureMode(sensor_t *s) {
 #endif
 }
 
+static void warmupAndLockWhiteBalance(sensor_t *s) {
+  if (!s) return;
+
+  Serial.printf("[CAM] AWB warmup under LED: %d frames\n", AWB_WARMUP_FRAMES);
+  s->set_whitebal(s, 1);
+  s->set_awb_gain(s, 1);
+  s->set_wb_mode(s, WB_MODE);
+
+  setLEDBrightness(LED_BRIGHTNESS);
+  delay(LED_PREHEAT_MS);
+  for (int i = 0; i < AWB_WARMUP_FRAMES; ++i) {
+    discard_one_frame();
+    delay(30);
+  }
+
+#if ENABLE_AWB_LOCK
+  s->set_whitebal(s, 0);
+  Serial.println("[CAM] AWB locked after LED warmup");
+#else
+  Serial.println("[CAM] AWB left automatic after LED warmup");
+#endif
+  setLEDBrightness(0);
+}
+
 // ---------- 拍照 + 存檔（LED 先穩定，丟 2 幀再拍） ----------
 void photo_save(const char *filePath) {
   if (!g_sd_ready && !remountSdCard()) {
@@ -410,6 +511,7 @@ void photo_save(const char *filePath) {
   // 1) LED 預熱與穩定
   setLEDBrightness(LED_BRIGHTNESS);
   delay(LED_PREHEAT_MS);
+  runCaptureAutofocus();
 
   // 2) 丟 2 幀（確保下一幀的曝光起點在 LED 穩定後）
   discard_one_frame();
@@ -430,6 +532,7 @@ void photo_save(const char *filePath) {
   // 4) 關燈
   setLEDBrightness(0);
   int64_t t_led_off = esp_timer_get_time();
+  releaseCaptureAutofocus();
 
   // 5) 寫入（原子）+ 驗證；失敗降速重掛一次
   double write_ms = 0.0, write_mbps = 0.0;
@@ -473,6 +576,7 @@ void setup() {
   // LED：用 LEDC（避免與 camera LEDC 衝突）
   pinMode(LED_PIN, OUTPUT);
   led_init();
+  statusBlink(1);
 
   // ===== 相機設定（單緩衝 + WHEN_EMPTY 是關鍵）=====
   camera_config_t config;
@@ -505,18 +609,19 @@ void setup() {
 
   if (esp_camera_init(&config) != ESP_OK) {
     Serial.println("[CAM] init failed");
-    while (true) { delay(1000); }
+    fatalBlinkLoop(2);
   }
 
   // 套用曝光/增益模式
   sensor_t *s = esp_camera_sensor_get();
   applyExposureMode(s);
   initAutofocus(s);
+  warmupAndLockWhiteBalance(s);
 
   // 掛載 SD（多時脈嘗試）
   if (!sd_init_fast()) {
     Serial.println("[SD] mount failed (all speeds tried).");
-    while (true) { delay(1000); }
+    fatalBlinkLoop(3);
   }
 
   recoverImageCounter();
