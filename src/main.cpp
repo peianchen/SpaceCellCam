@@ -152,13 +152,13 @@ static void initAutofocus(sensor_t *s) {
   }
   if (autofocusReachedStableState(AF_SETUP_SETTLE_MS)) {
     Serial.printf("[AF] stable focus reached, status=%d\n", ov5640_af_status());
+    if (ov5640_af_stop()) {
+      Serial.println("[AF] focus locked");
+    } else {
+      Serial.println("[AF] focus lock command failed");
+    }
   } else {
-    Serial.printf("[AF] focus did not stabilize in time, status=%d\n", ov5640_af_status());
-  }
-  if (ov5640_af_stop()) {
-    Serial.println("[AF] focus locked");
-  } else {
-    Serial.println("[AF] focus lock command failed");
+    Serial.printf("[AF] WARNING: focus did not stabilize in time, status=%d — not locking\n", ov5640_af_status());
   }
   setLEDBrightness(0);
 #else
@@ -248,7 +248,7 @@ static void recoverImageCounter() {
   int max_number = 0;
   if (!dir.open(folder)) {
     Serial.printf("[SD] open last bucket failed: %s\n", folder);
-    imgCount = last_bucket * BUCKET_SIZE;
+    imgCount = (last_bucket + 1) * BUCKET_SIZE;
     return;
   }
 
@@ -266,7 +266,7 @@ static void recoverImageCounter() {
   }
   dir.close();
 
-  imgCount = max_number;
+  imgCount = (max_number == 0) ? (last_bucket * BUCKET_SIZE) : max_number;
   Serial.printf("[SD] recovered image counter: %d (next: %d)\n", imgCount, imgCount + 1);
 }
 
