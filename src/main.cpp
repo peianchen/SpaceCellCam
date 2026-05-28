@@ -33,10 +33,10 @@
 #define BUCKET_SIZE       500        // 每個資料夾最多檔案數
 #define XCLK_FREQ_HZ      5000000    // 5 MHz（穩；可視情況試 20 MHz）
 #define LED_PREHEAT_MS    200        // LED 預熱
-#define LED_BRIGHTNESS    10         // LED 亮度（0~255）
+#define LED_BRIGHTNESS    40         // LED 亮度（0~255）
 #define STATUS_LED_BRIGHTNESS 80     // 不接Serial時用補光LED顯示狀態
-#define ENABLE_AUTOFOCUS  1          // 只在 OV5640 + AF 模組時生效
-#define AF_LOCK_MODE      3          // 0=關AF  1=setup後stop鎖焦  2=setup後release  3=每張中心single AF後release
+#define ENABLE_AUTOFOCUS  0          // 只在 OV5640 + AF 模組時生效
+#define AF_LOCK_MODE      0          // 0=關AF  1=setup後stop鎖焦  2=setup後release  3=每張中心single AF後release
 #define AF_SETUP_SETTLE_MS 1500      // setup 時給 AF 收斂的時間
 #define AF_CAPTURE_SETTLE_MS 5000    // 每張中心single AF最多等待時間
 #define AF_POLL_MS        50         // setup 時輪詢 AF 狀態間隔
