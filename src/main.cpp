@@ -36,9 +36,9 @@
 #define LED_BRIGHTNESS    10         // LED 亮度（0~255）
 #define STATUS_LED_BRIGHTNESS 80     // 不接Serial時用補光LED顯示狀態
 #define ENABLE_AUTOFOCUS  1          // 只在 OV5640 + AF 模組時生效
-#define AF_LOCK_MODE      1          // 0=關AF  1=setup後stop鎖焦  2=setup後release  3=每張中心single AF後release
+#define AF_LOCK_MODE      3          // 0=關AF  1=setup後stop鎖焦  2=setup後release  3=每張中心single AF後release
 #define AF_SETUP_SETTLE_MS 1500      // setup 時給 AF 收斂的時間
-#define AF_CAPTURE_SETTLE_MS 700     // 每張短暫AF最多等待時間，避免拖垮10秒週期
+#define AF_CAPTURE_SETTLE_MS 5000    // 每張中心single AF最多等待時間
 #define AF_POLL_MS        50         // setup 時輪詢 AF 狀態間隔
 #define AF_STABLE_COUNT   3          // 連續幾次穩定才視為已對焦
 #define AF_CENTER_X       30         // OV5640 AF grid: 0~79
