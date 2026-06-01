@@ -17,6 +17,7 @@
 #include "esp_camera.h"
 #include "SPI.h"
 #include "esp_timer.h"
+#include <stdarg.h>
 #include <SdFat.h>
 #include "ov5640_af_support.h"
 
@@ -29,18 +30,34 @@
 // ===== 參數 =====
 #define TARGET_PERIOD_S   10         // 週期（秒）
 #define LED_PIN           D1         // 補光 LED 腳位
+#define DEBUG_UART_RX_PIN D7         // XIAO ESP32S3 RX / GPIO44，接 Debug Mate TX
+#define DEBUG_UART_TX_PIN D6         // XIAO ESP32S3 TX / GPIO43，接 Debug Mate RX
+#define DEBUG_BAUD        115200
 #define SD_CS             21         // SD CS 腳位
 #define BUCKET_SIZE       500        // 每個資料夾最多檔案數
-#define XCLK_FREQ_HZ      5000000    // 5 MHz（穩；可視情況試 20 MHz）
+#define XCLK_FREQ_HZ      20000000   // OV5640 常用 20 MHz；若仍出現壞圖再降 10 MHz
+#define CAPTURE_FRAME_SIZE FRAMESIZE_QSXGA
+#define CAPTURE_RESTORE_SETTLE_MS 120 // AF 從 QVGA 切回 QSXGA 後，先讓 sensor/JPEG 穩定
+#define CAPTURE_DISCARD_FRAMES 2     // 正式拍照前丟幾幀；2 較穩但 LED 會多亮約 1~3 秒
 #define LED_PREHEAT_MS    200        // LED 預熱
 #define LED_BRIGHTNESS    40         // LED 亮度（0~255）
 #define STATUS_LED_BRIGHTNESS 80     // 不接Serial時用補光LED顯示狀態
-#define ENABLE_AUTOFOCUS  0          // 只在 OV5640 + AF 模組時生效
-#define AF_LOCK_MODE      0          // 0=關AF  1=setup後stop鎖焦  2=setup後release  3=每張中心single AF後release
-#define AF_SETUP_SETTLE_MS 1500      // setup 時給 AF 收斂的時間
-#define AF_CAPTURE_SETTLE_MS 5000    // 每張中心single AF最多等待時間
-#define AF_POLL_MS        50         // setup 時輪詢 AF 狀態間隔
-#define AF_STABLE_COUNT   3          // 連續幾次穩定才視為已對焦
+#define ENABLE_DEBUG_LOG  1          // 1=印出詳細 debug log；0=只保留必要訊息
+#define AF_DEBUG_WAIT_LOG 0          // 1=印 AF wait/pump 細節；0=關閉，避免 Serial 輸出拖慢 AF
+#define AF_DEBUG_EVERY_POLL 0        // 1=每次 AF 輪詢都印 status，只有 AF_DEBUG_WAIT_LOG=1 時有效
+#define ENABLE_AUTOFOCUS  1          // 只在 OV5640 + AF 模組時生效
+#define AF_LOCK_MODE      3          // 0=關AF  1=setup後stop鎖焦  2=setup後release  3=每張中心single AF後release
+#define AF_LED_PREHEAT_MS 50         // AF 補光預熱，獨立於正式拍照補光
+#define AF_LED_BRIGHTNESS 24         // AF 補光亮度，降低對樣本的影響
+#define AF_SETUP_SETTLE_MS 800       // setup single AF 最多等待時間
+#define AF_CAPTURE_SETTLE_MS 2500    // 每張 AF 最多等待時間；AF pump 先降 QVGA
+#define AF_PUMP_FRAME_SIZE FRAMESIZE_QVGA
+#define AF_SWITCH_FRAME_SIZE_FOR_PUMP 1 // 1=AF pump 先切 QVGA，加快對焦；拍照前切回 QSXGA
+#define AF_PUMP_FRAME_COUNT 6        // AF 時快速出幾張低解析度 frame 讓韌體判斷
+#define AF_KEEP_LOCK_AFTER_CAPTURE 0 // 0=每張拍完 release，下張重新對焦；1=拍完不 release
+#define AF_REFOCUS_EVERY_N 0         // 0=成功後不週期重對焦；>0=每 N 張重對焦一次
+#define AF_POLL_MS        25         // AF 狀態輪詢間隔
+#define AF_STABLE_COUNT   2          // 連續幾次 focused 才視為已對焦
 #define AF_CENTER_X       30         // OV5640 AF grid: 0~79
 #define AF_CENTER_Y       22         // OV5640 AF grid: 0~59
 #define AF_CENTER_W       20
@@ -70,10 +87,71 @@ File32  file;
 uint32_t g_sd_hz = 0;
 bool g_af_supported = false;
 bool g_af_ready = false;
+bool g_af_focus_locked = false;
+int g_af_last_focus_img = 0;
 bool g_sd_ready = false;
 
 // ===== 計數（照片序號）=====
 int imgCount = 0;
+
+struct DualLogger {
+  void begin(unsigned long baud) {
+    Serial.begin(baud);
+    Serial1.begin(baud, SERIAL_8N1, DEBUG_UART_RX_PIN, DEBUG_UART_TX_PIN);
+  }
+
+  template <typename T>
+  void print(const T &value) {
+    Serial.print(value);
+    Serial1.print(value);
+  }
+
+  template <typename T>
+  void println(const T &value) {
+    Serial.println(value);
+    Serial1.println(value);
+  }
+
+  void println() {
+    Serial.println();
+    Serial1.println();
+  }
+
+  int printf(const char *format, ...) {
+    char buffer[512];
+    va_list args;
+    va_start(args, format);
+    const int written = vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+    Serial.print(buffer);
+    Serial1.print(buffer);
+    return written;
+  }
+};
+
+DualLogger LOG;
+
+#if ENABLE_DEBUG_LOG
+#define DBG_PRINTF(...) LOG.printf(__VA_ARGS__)
+#define DBG_PRINTLN(x) LOG.println(x)
+#else
+#define DBG_PRINTF(...)
+#define DBG_PRINTLN(x)
+#endif
+
+static const char* afStatusName(int status) {
+  switch (status) {
+    case 0x10: return "focused";
+    case 0x70: return "idle";
+    case -1: return "not-ready";
+    case -2: return "fw-not-ready";
+    case -3: return "unsupported";
+    default:
+      if (status >= 0x00 && status <= 0x0F) return "busy";
+      if (status >= 0x80 && status <= 0x8F) return "searching";
+      return "unknown";
+  }
+}
 
 // ---------- LED ----------
 static inline void led_init() {
@@ -109,7 +187,7 @@ bool sd_begin_mhz(uint32_t mhz) {
   if (sd.begin(cfg)) {
     g_sd_hz = mhz * 1000000UL;
     g_sd_ready = true;
-    Serial.printf("[SD] mounted at %u MHz\n", (unsigned)mhz);
+    LOG.printf("[SD] mounted at %u MHz\n", (unsigned)mhz);
     return true;
   }
   return false;
@@ -129,105 +207,213 @@ static inline void discard_one_frame() {
   if (fb) esp_camera_fb_return(fb);
 }
 
-static bool autofocusReachedStableState(uint32_t timeout_ms) {
+static bool autofocusReachedStableState(uint32_t timeout_ms, bool require_focused, bool pump_frames, uint8_t min_pump_frames, bool accept_after_min_pump) {
   const uint32_t start = millis();
   int stable_count = 0;
+  int last_status = 9999;
+  uint8_t pumped_frames = 0;
+
+#if AF_DEBUG_WAIT_LOG
+  DBG_PRINTF("[AF][WAIT] start timeout=%lu ms require_focused=%d stable_count=%d pump_frames=%d min_pump=%u\n",
+             (unsigned long)timeout_ms, require_focused ? 1 : 0, AF_STABLE_COUNT, pump_frames ? 1 : 0, min_pump_frames);
+#endif
 
   while ((millis() - start) < timeout_ms) {
     const int status = ov5640_af_status();
-    if (status == 0x10 || status == 0x70) {
+    const uint32_t elapsed = millis() - start;
+    const bool focused = status == 0x10;
+    const bool stable_idle = !require_focused && status == 0x70;
+#if AF_DEBUG_WAIT_LOG
+#if AF_DEBUG_EVERY_POLL
+    DBG_PRINTF("[AF][WAIT] t=%lu ms status=0x%02X(%s) stable=%d/%d\n",
+               (unsigned long)elapsed, status, afStatusName(status), stable_count, AF_STABLE_COUNT);
+#else
+    if (status != last_status) {
+      DBG_PRINTF("[AF][WAIT] t=%lu ms status=0x%02X(%s) stable=%d/%d\n",
+                 (unsigned long)elapsed, status, afStatusName(status), stable_count, AF_STABLE_COUNT);
+      last_status = status;
+    }
+#endif
+#endif
+    if ((focused || stable_idle) && pumped_frames >= min_pump_frames) {
       if (++stable_count >= AF_STABLE_COUNT) {
+#if AF_DEBUG_WAIT_LOG
+        DBG_PRINTF("[AF][WAIT] done t=%lu ms status=0x%02X(%s)\n",
+                   (unsigned long)(millis() - start), status, afStatusName(status));
+#endif
         return true;
       }
     } else if (status < 0) {
+#if AF_DEBUG_WAIT_LOG
+      DBG_PRINTF("[AF][WAIT] abort t=%lu ms status=%d(%s)\n",
+                 (unsigned long)elapsed, status, afStatusName(status));
+#endif
       return false;
     } else {
       stable_count = 0;
     }
+
+    if (pump_frames) {
+      const int64_t t_pump_start = esp_timer_get_time();
+      camera_fb_t *fb = esp_camera_fb_get();
+      const int64_t t_pump_end = esp_timer_get_time();
+      if (fb) {
+        const size_t pump_len = fb->len;
+        esp_camera_fb_return(fb);
+        ++pumped_frames;
+#if AF_DEBUG_WAIT_LOG
+        DBG_PRINTF("[AF][WAIT] pump frame %.1f ms len=%u\n",
+                   (t_pump_end - t_pump_start) / 1000.0, (unsigned)pump_len);
+#endif
+      } else {
+#if AF_DEBUG_WAIT_LOG
+        DBG_PRINTLN("[AF][WAIT] pump frame failed");
+#endif
+      }
+    }
     delay(AF_POLL_MS);
   }
 
+  const int final_status = ov5640_af_status();
+#if AF_DEBUG_WAIT_LOG
+  DBG_PRINTF("[AF][WAIT] timeout t=%lu ms final_status=0x%02X(%s)\n",
+             (unsigned long)(millis() - start), final_status, afStatusName(final_status));
+#endif
+  if ((final_status == 0x10 || (!require_focused && final_status == 0x70)) &&
+      pumped_frames >= min_pump_frames) {
+    return true;
+  }
   return false;
 }
 
 static void initAutofocus(sensor_t *s) {
 #if ENABLE_AUTOFOCUS && (AF_LOCK_MODE != 0)
+  const int64_t t_af_start = esp_timer_get_time();
+  LOG.printf("[AF] config lock_mode=%d setup_timeout=%d ms capture_timeout=%d ms poll=%d ms stable=%d led=%d preheat=%d ms\n",
+                AF_LOCK_MODE, AF_SETUP_SETTLE_MS, AF_CAPTURE_SETTLE_MS, AF_POLL_MS, AF_STABLE_COUNT,
+                AF_LED_BRIGHTNESS, AF_LED_PREHEAT_MS);
   g_af_supported = ov5640_af_supported(s);
   if (!g_af_supported) {
-    Serial.printf("[AF] unsupported sensor PID=0x%04X\n", s ? s->id.PID : 0);
+    LOG.printf("[AF] unsupported sensor PID=0x%04X\n", s ? s->id.PID : 0);
     return;
   }
 
-  Serial.printf("[AF] OV5640 AF library available: %s\n",
+  LOG.printf("[AF] OV5640 AF library available: %s\n",
                 ov5640_af_library_available() ? "yes" : "no");
   if (!ov5640_af_begin(s)) {
-    Serial.printf("[AF] init failed, focusInit=%d\n", ov5640_af_init_result());
-    Serial.println("[AF] Check whether the camera module actually has AF/VCM power.");
+    LOG.printf("[AF] init failed, focusInit=%d\n", ov5640_af_init_result());
+    LOG.println("[AF] Check whether the camera module actually has AF/VCM power.");
     return;
   }
 
   g_af_ready = true;
-  Serial.printf("[AF] firmware ready, status=%d\n", ov5640_af_status());
+  LOG.printf("[AF] firmware ready, status=%d(%s)\n", ov5640_af_status(), afStatusName(ov5640_af_status()));
 
 #if AF_LOCK_MODE == 3
-  Serial.println("[AF] per-capture autofocus enabled");
-#else
-  setLEDBrightness(LED_BRIGHTNESS);
-  delay(LED_PREHEAT_MS);
-
-  if (ov5640_af_focus_zone(AF_CENTER_X, AF_CENTER_Y, AF_CENTER_W, AF_CENTER_H)) {
-    Serial.printf("[AF] center focus zone x=%d y=%d w=%d h=%d\n",
+  LOG.println("[AF] per-capture autofocus enabled");
+  if (ov5640_af_set_focus_zone(AF_CENTER_X, AF_CENTER_Y, AF_CENTER_W, AF_CENTER_H)) {
+    LOG.printf("[AF] center focus zone x=%d y=%d w=%d h=%d\n",
                   AF_CENTER_X, AF_CENTER_Y, AF_CENTER_W, AF_CENTER_H);
   } else {
-    Serial.println("[AF] center focus zone setup failed, fallback to continuous AF");
+    LOG.println("[AF] center focus zone setup failed");
+  }
+#else
+  DBG_PRINTF("[AF][LED] on brightness=%d preheat=%d ms\n", AF_LED_BRIGHTNESS, AF_LED_PREHEAT_MS);
+  setLEDBrightness(AF_LED_BRIGHTNESS);
+  delay(AF_LED_PREHEAT_MS);
+
+  if (ov5640_af_set_focus_zone(AF_CENTER_X, AF_CENTER_Y, AF_CENTER_W, AF_CENTER_H)) {
+    LOG.printf("[AF] center focus zone x=%d y=%d w=%d h=%d\n",
+                  AF_CENTER_X, AF_CENTER_Y, AF_CENTER_W, AF_CENTER_H);
+  } else {
+    LOG.println("[AF] center focus zone setup failed");
   }
 
-  if (ov5640_af_enable_continuous()) {
-    Serial.println("[AF] continuous autofocus enabled");
+  if (ov5640_af_trigger_single()) {
+    LOG.printf("[AF] setup single autofocus triggered, status=%d(%s)\n", ov5640_af_status(), afStatusName(ov5640_af_status()));
   } else {
-    Serial.println("[AF] continuous autofocus start failed");
+    LOG.println("[AF] setup single autofocus start failed");
   }
-  if (autofocusReachedStableState(AF_SETUP_SETTLE_MS)) {
-    Serial.printf("[AF] stable focus reached, status=%d\n", ov5640_af_status());
+  if (autofocusReachedStableState(AF_SETUP_SETTLE_MS, true, true, 1, false)) {
+    LOG.printf("[AF] stable focus reached, status=%d\n", ov5640_af_status());
 #if AF_LOCK_MODE == 2
     if (ov5640_af_release()) {
-      Serial.println("[AF] focus released (VCM heat test mode)");
+      LOG.println("[AF] focus released (VCM heat test mode)");
     } else {
-      Serial.println("[AF] focus release command failed");
+      LOG.println("[AF] focus release command failed");
     }
 #else
     if (ov5640_af_stop()) {
-      Serial.println("[AF] focus locked");
+      LOG.println("[AF] focus locked");
     } else {
-      Serial.println("[AF] focus lock command failed");
+      LOG.println("[AF] focus lock command failed");
     }
 #endif
   } else {
-    Serial.printf("[AF] WARNING: focus did not stabilize in time, status=%d — not locking\n", ov5640_af_status());
+    LOG.printf("[AF] WARNING: focus did not stabilize in time, status=%d(%s) - not locking\n",
+                  ov5640_af_status(), afStatusName(ov5640_af_status()));
   }
   setLEDBrightness(0);
+  DBG_PRINTF("[AF][LED] off, setup_af_elapsed=%.1f ms\n", (esp_timer_get_time() - t_af_start) / 1000.0);
 #endif
 #else
   (void)s;
-  Serial.println("[AF] disabled by config");
+  LOG.println("[AF] disabled by config");
 #endif
 }
 
 static bool runCaptureAutofocus() {
 #if ENABLE_AUTOFOCUS && (AF_LOCK_MODE == 3)
+  const int64_t t_af_start = esp_timer_get_time();
   if (!g_af_ready) return false;
+  sensor_t *s = esp_camera_sensor_get();
 
+#if AF_KEEP_LOCK_AFTER_CAPTURE
+  if (g_af_focus_locked && (AF_REFOCUS_EVERY_N <= 0 || (imgCount - g_af_last_focus_img) < AF_REFOCUS_EVERY_N)) {
+    DBG_PRINTF("[AF][CAP] reuse locked focus from img=%d, current=%d\n", g_af_last_focus_img, imgCount);
+    return true;
+  }
+#endif
+
+  DBG_PRINTF("[AF][CAP] start tap-style center focus, status_before=%d(%s)\n", ov5640_af_status(), afStatusName(ov5640_af_status()));
+#if AF_SWITCH_FRAME_SIZE_FOR_PUMP
+  if (s && s->set_framesize(s, AF_PUMP_FRAME_SIZE) == 0) {
+    DBG_PRINTLN("[AF][CAP] frame size switched for fast AF pump");
+  } else {
+    LOG.println("[AF] WARNING: failed to switch frame size for AF pump");
+  }
+#else
+  (void)s;
+  DBG_PRINTLN("[AF][CAP] keeping QSXGA frame size for AF pump");
+#endif
   if (!ov5640_af_focus_zone(AF_CENTER_X, AF_CENTER_Y, AF_CENTER_W, AF_CENTER_H)) {
-    Serial.println("[AF] per-capture start failed");
+    LOG.println("[AF] per-capture start failed");
+#if AF_SWITCH_FRAME_SIZE_FOR_PUMP
+    if (s) s->set_framesize(s, CAPTURE_FRAME_SIZE);
+#endif
     return false;
   }
-  if (!autofocusReachedStableState(AF_CAPTURE_SETTLE_MS)) {
-    Serial.printf("[AF] per-capture did not stabilize, status=%d\n", ov5640_af_status());
+  if (!autofocusReachedStableState(AF_CAPTURE_SETTLE_MS, false, true, AF_PUMP_FRAME_COUNT, false)) {
+    LOG.printf("[AF] per-capture did not stabilize, status=%d\n", ov5640_af_status());
+#if AF_SWITCH_FRAME_SIZE_FOR_PUMP
+    if (s) s->set_framesize(s, CAPTURE_FRAME_SIZE);
+#endif
     return false;
   }
   if (ov5640_af_stop()) {
-    Serial.println("[AF] per-capture focused");
+    LOG.printf("[AF] per-capture focus confirmed, elapsed=%.1f ms, status=%d(%s)\n",
+                  (esp_timer_get_time() - t_af_start) / 1000.0, ov5640_af_status(), afStatusName(ov5640_af_status()));
+    g_af_focus_locked = true;
+    g_af_last_focus_img = imgCount;
   }
+#if AF_SWITCH_FRAME_SIZE_FOR_PUMP
+  if (s && s->set_framesize(s, CAPTURE_FRAME_SIZE) == 0) {
+    DBG_PRINTLN("[AF][CAP] frame size restored for QSXGA capture");
+    delay(CAPTURE_RESTORE_SETTLE_MS);
+  } else {
+    LOG.println("[AF] WARNING: failed to restore capture frame size");
+  }
+#endif
   return true;
 #else
   return false;
@@ -236,8 +422,14 @@ static bool runCaptureAutofocus() {
 
 static void releaseCaptureAutofocus() {
 #if ENABLE_AUTOFOCUS && (AF_LOCK_MODE == 3)
+#if AF_KEEP_LOCK_AFTER_CAPTURE
+  if (g_af_focus_locked) {
+    DBG_PRINTLN("[AF] keep focus locked after capture");
+    return;
+  }
+#endif
   if (g_af_ready && ov5640_af_release()) {
-    Serial.println("[AF] per-capture released");
+    LOG.println("[AF] per-capture released");
   }
 #endif
 }
@@ -246,19 +438,19 @@ static void releaseCaptureAutofocus() {
 static bool sd_ensure_dir(const char* path) {
   if (sd.exists(path)) return true;
   if (sd.mkdir(path)) {
-    Serial.printf("[SD] mkdir: %s\n", path);
+    LOG.printf("[SD] mkdir: %s\n", path);
     return true;
   }
-  Serial.printf("[SD] mkdir failed: %s\n", path);
+  LOG.printf("[SD] mkdir failed: %s\n", path);
   return false;
 }
 
 static bool remountSdCard() {
   sd.end();
   g_sd_ready = false;
-  Serial.println("[SD] remounting...");
+  LOG.println("[SD] remounting...");
   if (!sd_init_fast()) {
-    Serial.println("[SD] remount failed");
+    LOG.println("[SD] remount failed");
     return false;
   }
   return true;
@@ -292,7 +484,7 @@ static void recoverImageCounter() {
   File32 dir = sd.open("/", O_RDONLY);
 
   if (!dir || !dir.isDir()) {
-    Serial.println("[SD] root open failed, start counter at 0");
+    LOG.println("[SD] root open failed, start counter at 0");
     imgCount = 0;
     return;
   }
@@ -314,7 +506,7 @@ static void recoverImageCounter() {
 
   if (last_bucket < 0) {
     imgCount = 0;
-    Serial.println("[SD] no previous images found");
+    LOG.println("[SD] no previous images found");
     return;
   }
 
@@ -324,7 +516,7 @@ static void recoverImageCounter() {
   int max_number = 0;
   dir = sd.open(folder, O_RDONLY);
   if (!dir || !dir.isDir()) {
-    Serial.printf("[SD] open last bucket failed: %s\n", folder);
+    LOG.printf("[SD] open last bucket failed: %s\n", folder);
     imgCount = (last_bucket + 1) * BUCKET_SIZE;
     return;
   }
@@ -344,7 +536,7 @@ static void recoverImageCounter() {
   dir.close();
 
   imgCount = (max_number == 0) ? (last_bucket * BUCKET_SIZE) : max_number;
-  Serial.printf("[SD] recovered image counter: %d (next: %d)\n", imgCount, imgCount + 1);
+  LOG.printf("[SD] recovered image counter: %d (next: %d)\n", imgCount, imgCount + 1);
 }
 
 // ---------- Atomic 寫入 + 驗證 ----------
@@ -354,7 +546,7 @@ bool atomicWriteAndVerify(const char* finalPath, const uint8_t* data, size_t len
   snprintf(tmpPath, sizeof(tmpPath), "%s.tmp", finalPath);
 
   File32 f = sd.open(tmpPath, O_CREAT | O_TRUNC | O_WRITE);
-  if (!f) { Serial.println("[SD] open tmp failed"); return false; }
+  if (!f) { LOG.println("[SD] open tmp failed"); return false; }
 
   // 預配置（失敗不致命）
   f.preAllocate(len);
@@ -367,7 +559,7 @@ bool atomicWriteAndVerify(const char* finalPath, const uint8_t* data, size_t len
     size_t n = (len - written) > CHUNK ? CHUNK : (len - written);
     size_t w = f.write(data + written, n);
     if (w != n) {
-      Serial.printf("[SD] write short (%u/%u) at %u\n",
+      LOG.printf("[SD] write short (%u/%u) at %u\n",
                     (unsigned)w, (unsigned)n, (unsigned)written);
       f.close();
       sd.remove(tmpPath);
@@ -377,7 +569,7 @@ bool atomicWriteAndVerify(const char* finalPath, const uint8_t* data, size_t len
   }
 
   if (!f.sync()) {
-    Serial.println("[SD] sync failed");
+    LOG.println("[SD] sync failed");
     f.close();
     sd.remove(tmpPath);
     return false;
@@ -385,20 +577,20 @@ bool atomicWriteAndVerify(const char* finalPath, const uint8_t* data, size_t len
   f.close();
 
   if (sd.exists(finalPath) && !sd.remove(finalPath)) {
-    Serial.println("[SD] remove final failed");
+    LOG.println("[SD] remove final failed");
     sd.remove(tmpPath);
     return false;
   }
 
   if (!sd.rename(tmpPath, finalPath)) {
-    Serial.println("[SD] rename tmp->final failed");
+    LOG.println("[SD] rename tmp->final failed");
     sd.remove(tmpPath);
     return false;
   }
 
   File32 r = sd.open(finalPath, O_READ);
   if (!r) {
-    Serial.println("[SD] reopen final failed");
+    LOG.println("[SD] reopen final failed");
     sd.remove(finalPath);
     return false;
   }
@@ -406,7 +598,7 @@ bool atomicWriteAndVerify(const char* finalPath, const uint8_t* data, size_t len
   r.close();
 
   if (sz != len) {
-    Serial.printf("[SD] verify size mismatch: %llu vs %u\n",
+    LOG.printf("[SD] verify size mismatch: %llu vs %u\n",
                   (unsigned long long)sz, (unsigned)len);
     sd.remove(finalPath);
     return false;
@@ -468,9 +660,9 @@ static void applyExposureMode(sensor_t *s) {
   s->set_colorbar(s, 0);
 
 #if EXPOSURE_MODE == 0
-  Serial.println("[CAM] Exposure mode: AUTO");
+  LOG.println("[CAM] Exposure mode: AUTO");
 #else
-  Serial.printf("[CAM] Exposure mode: FIXED  AEC=%d  AGC=%d  CEIL=%d\n",
+  LOG.printf("[CAM] Exposure mode: FIXED  AEC=%d  AGC=%d  CEIL=%d\n",
                 FIX_AEC_VALUE, FIX_AGC_GAIN, FIX_GAIN_CEIL);
 #endif
 }
@@ -478,7 +670,7 @@ static void applyExposureMode(sensor_t *s) {
 static void warmupAndLockWhiteBalance(sensor_t *s) {
   if (!s) return;
 
-  Serial.printf("[CAM] AWB warmup under LED: %d frames\n", AWB_WARMUP_FRAMES);
+  LOG.printf("[CAM] AWB warmup under LED: %d frames\n", AWB_WARMUP_FRAMES);
   s->set_whitebal(s, 1);
   s->set_awb_gain(s, 1);
   s->set_wb_mode(s, WB_MODE);
@@ -492,36 +684,55 @@ static void warmupAndLockWhiteBalance(sensor_t *s) {
 
 #if ENABLE_AWB_LOCK
   s->set_whitebal(s, 0);
-  Serial.println("[CAM] AWB locked after LED warmup");
+  LOG.println("[CAM] AWB locked after LED warmup");
 #else
-  Serial.println("[CAM] AWB left automatic after LED warmup");
+  LOG.println("[CAM] AWB left automatic after LED warmup");
 #endif
   setLEDBrightness(0);
 }
 
 // ---------- 拍照 + 存檔（LED 先穩定，丟 2 幀再拍） ----------
 void photo_save(const char *filePath) {
+  const int64_t t_photo_start = esp_timer_get_time();
+  DBG_PRINTF("[CAP] begin img=%d path=%s sd_ready=%d af_ready=%d af_mode=%d\n",
+             imgCount, filePath, g_sd_ready ? 1 : 0, g_af_ready ? 1 : 0, AF_LOCK_MODE);
   if (!g_sd_ready && !remountSdCard()) {
-    Serial.println("[SD] unavailable, skip capture save");
+    LOG.println("[SD] unavailable, skip capture save");
     return;
   }
 
   int64_t t_led_on = esp_timer_get_time();
 
   // 1) LED 預熱與穩定
+  DBG_PRINTF("[CAP][LED] on brightness=%d preheat=%d ms\n", LED_BRIGHTNESS, LED_PREHEAT_MS);
   setLEDBrightness(LED_BRIGHTNESS);
   delay(LED_PREHEAT_MS);
+#if ENABLE_AUTOFOCUS && (AF_LOCK_MODE == 3)
+  if (!runCaptureAutofocus()) {
+    LOG.println("[AF] capture skipped because focus was not confirmed");
+    setLEDBrightness(0);
+    releaseCaptureAutofocus();
+    return;
+  }
+#else
   runCaptureAutofocus();
+#endif
 
-  // 2) 丟 2 幀（確保下一幀的曝光起點在 LED 穩定後）
-  discard_one_frame();
-  discard_one_frame();
+  // 2) 丟幀（確保下一幀的曝光起點在 LED 穩定後）
+  const int64_t t_discard_start = esp_timer_get_time();
+  for (uint8_t i = 0; i < CAPTURE_DISCARD_FRAMES; ++i) {
+    discard_one_frame();
+  }
+  const int64_t t_discard_end = esp_timer_get_time();
+  DBG_PRINTF("[CAP] discarded %d frames in %.1f ms\n",
+             CAPTURE_DISCARD_FRAMES, (t_discard_end - t_discard_start) / 1000.0);
 
   // 3) 正式取幀
+  const int64_t t_fb_start = esp_timer_get_time();
   camera_fb_t *fb = esp_camera_fb_get();
   int64_t t_got_fb = esp_timer_get_time();
   if (!fb) {
-    Serial.println("[CAM] esp_camera_fb_get() failed");
+    LOG.println("[CAM] esp_camera_fb_get() failed");
     setLEDBrightness(0);
     releaseCaptureAutofocus();
     return;
@@ -529,17 +740,20 @@ void photo_save(const char *filePath) {
 
   // 立刻把會用到的資料先存起來（避免 fb_return 後 use-after-free）
   const size_t img_len = fb->len;
+  DBG_PRINTF("[CAP] fb_get=%.1f ms len=%u bytes format=%d\n",
+             (t_got_fb - t_fb_start) / 1000.0, (unsigned)img_len, fb->format);
 
   // 4) 關燈
   setLEDBrightness(0);
   int64_t t_led_off = esp_timer_get_time();
+  DBG_PRINTF("[CAP][LED] off led_on_duration=%.1f ms\n", (t_led_off - t_led_on) / 1000.0);
   releaseCaptureAutofocus();
 
   // 5) 寫入（原子）+ 驗證；失敗降速重掛一次
   double write_ms = 0.0, write_mbps = 0.0;
   bool ok = atomicWriteAndVerify(filePath, fb->buf, img_len, &write_ms, &write_mbps);
   if (!ok) {
-    Serial.println("[SD] write+verify failed, remount slower and retry once...");
+    LOG.println("[SD] write+verify failed, remount slower and retry once...");
     if (remountSdCard()) {
       ok = atomicWriteAndVerify(filePath, fb->buf, img_len, &write_ms, &write_mbps);
     }
@@ -557,20 +771,22 @@ void photo_save(const char *filePath) {
   double led_to_fb_ms    = (t_got_fb - t_led_on) / 1000.0;
   double fb_to_ledoff_ms = (t_led_off - t_got_fb) / 1000.0;
 
-  Serial.printf("Timings  LED->FB: %.1f ms, FB->LEDoff: %.1f ms, FB->SD(write): %.1f ms\n",
+  LOG.printf("Timings  LED->FB: %.1f ms, FB->LEDoff: %.1f ms, FB->SD(write): %.1f ms\n",
                 led_to_fb_ms, fb_to_ledoff_ms, write_ms);
-  Serial.printf("Size: %.2f MB, SD: %.2f MB/s  (SPI %.0f MHz)\n",
+  LOG.printf("Size: %.2f MB, SD: %.2f MB/s  (SPI %.0f MHz)\n",
                 img_len / (1024.0 * 1024.0), write_mbps, g_sd_hz / 1e6);
 
-  if (ok) Serial.printf("[OK] Saved: %s\n", filePath);
-  else    Serial.printf("[FAIL] Save failed: %s\n", filePath);
+  if (ok) LOG.printf("[OK] Saved: %s\n", filePath);
+  else    LOG.printf("[FAIL] Save failed: %s\n", filePath);
+  DBG_PRINTF("[CAP] total_elapsed=%.1f ms\n", (esp_timer_get_time() - t_photo_start) / 1000.0);
 
   delay(10);
 }
 
 void setup() {
-  Serial.begin(115200);
+  LOG.begin(DEBUG_BAUD);
   delay(100);
+  LOG.printf("[LOG] USB CDC + Serial1 enabled at %u baud (Serial1 RX=D7/GPIO44, TX=D6/GPIO43)\n", DEBUG_BAUD);
 
   SPI.begin();
 
@@ -601,7 +817,7 @@ void setup() {
   config.pin_reset = RESET_GPIO_NUM;
 
   config.xclk_freq_hz = XCLK_FREQ_HZ;
-  config.frame_size   = FRAMESIZE_QSXGA;      // 需要更穩就先降 UXGA/SXGA
+  config.frame_size   = CAPTURE_FRAME_SIZE;   // 需要更穩就先降 UXGA/SXGA
   config.pixel_format = PIXFORMAT_JPEG;
   config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
   config.fb_location  = CAMERA_FB_IN_PSRAM;
@@ -609,7 +825,7 @@ void setup() {
   config.fb_count     = 1;                    // ⭐ 單緩衝
 
   if (esp_camera_init(&config) != ESP_OK) {
-    Serial.println("[CAM] init failed");
+    LOG.println("[CAM] init failed");
     fatalBlinkLoop(2);
   }
 
@@ -621,13 +837,13 @@ void setup() {
 
   // 掛載 SD（多時脈嘗試）
   if (!sd_init_fast()) {
-    Serial.println("[SD] mount failed (all speeds tried).");
+    LOG.println("[SD] mount failed (all speeds tried).");
     fatalBlinkLoop(3);
   }
 
   recoverImageCounter();
 
-  Serial.println("Continuous mode: capture (no sleep).");
+  LOG.println("Continuous mode: capture (no sleep).");
 }
 
 void loop() {
@@ -673,11 +889,11 @@ void loop() {
     if (behind >= (int32_t)period_ms) {
       uint32_t skip = (behind / (int32_t)period_ms); // 已經落後幾個完整週期
       next_tick += skip * period_ms;
-      Serial.printf("[SCHED] behind %ld ms, skip %u slot(s) to realign.\n",
+      LOG.printf("[SCHED] behind %ld ms, skip %u slot(s) to realign.\n",
                     (long)behind, (unsigned)skip);
     } else {
       // 只是小落後（< 1 週期），不 skip，只記錄
-      Serial.printf("[SCHED] minor slip %ld ms (no skip)\n", (long)behind);
+      LOG.printf("[SCHED] minor slip %ld ms (no skip)\n", (long)behind);
     }
   }
 }

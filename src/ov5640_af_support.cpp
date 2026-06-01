@@ -95,7 +95,7 @@ bool ov5640_af_trigger_single() {
   return write_af_cmd(OV5640_AF_CMD_SINGLE);
 }
 
-bool ov5640_af_focus_zone(uint8_t x, uint8_t y, uint8_t w, uint8_t h) {
+bool ov5640_af_set_focus_zone(uint8_t x, uint8_t y, uint8_t w, uint8_t h) {
   if (!g_sensor || !g_af_ready) {
     return false;
   }
@@ -133,6 +133,13 @@ bool ov5640_af_focus_zone(uint8_t x, uint8_t y, uint8_t w, uint8_t h) {
     return false;
   }
   delay(20);
+  return true;
+}
+
+bool ov5640_af_focus_zone(uint8_t x, uint8_t y, uint8_t w, uint8_t h) {
+  if (!ov5640_af_set_focus_zone(x, y, w, h)) {
+    return false;
+  }
   return ov5640_af_trigger_single();
 }
 
