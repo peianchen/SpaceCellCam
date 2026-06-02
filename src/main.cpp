@@ -17,9 +17,18 @@
 #include "esp_camera.h"
 #include "SPI.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
+#include <math.h>
 #include <stdarg.h>
 #include <SdFat.h>
 #include "ov5640_af_support.h"
+
+#if __has_include("driver/temp_sensor.h")
+#include "driver/temp_sensor.h"
+#define HAS_LEGACY_TEMP_SENSOR 1
+#else
+#define HAS_LEGACY_TEMP_SENSOR 0
+#endif
 
 // ===== 相機腳位（Seeed XIAO ESP32S3）=====
 #ifndef CAMERA_MODEL_XIAO_ESP32S3
@@ -43,6 +52,11 @@
 #define LED_BRIGHTNESS    60         // LED 亮度（0~255）
 #define STATUS_LED_BRIGHTNESS 80     // 不接Serial時用補光LED顯示狀態
 #define ENABLE_DEBUG_LOG  1          // 1=印出詳細 debug log；0=只保留必要訊息
+#define ENABLE_CAMERA_LIFECYCLE_DEBUG 1 // 1=記錄 fb_get/return、記憶體、溫度、standby 狀態
+#define ENABLE_FB_FRAME_LOG 0        // 1=每次 fb_get/return 都印；0=只保留 runtime count，避免 AF pump 洗版
+#define ENABLE_SENSOR_STANDBY_AFTER_CAPTURE 1 // 1=每次拍照後嘗試讓 OV5640 進入 standby
+#define SENSOR_STANDBY_SETTLE_MS 80  // 進入 standby 後等待時間
+#define SENSOR_WAKE_SETTLE_MS 120    // 從 standby 喚醒後等待時間
 #define AF_DEBUG_WAIT_LOG 0          // 1=印 AF wait/pump 細節；0=關閉，避免 Serial 輸出拖慢 AF
 #define AF_DEBUG_EVERY_POLL 0        // 1=每次 AF 輪詢都印 status，只有 AF_DEBUG_WAIT_LOG=1 時有效
 #define ENABLE_AUTOFOCUS  1          // 只在 OV5640 + AF 模組時生效
@@ -90,6 +104,14 @@ bool g_af_ready = false;
 bool g_af_focus_locked = false;
 int g_af_last_focus_img = 0;
 bool g_sd_ready = false;
+bool g_sensor_standby = false;
+uint32_t g_fb_get_count = 0;
+uint32_t g_fb_return_count = 0;
+uint32_t g_capture_count = 0;
+uint32_t g_last_capture_ms = 0;
+uint32_t g_last_fb_get_ms = 0;
+uint32_t g_last_fb_return_ms = 0;
+const bool g_mjpeg_stream_active = false;
 
 // ===== 計數（照片序號）=====
 int imgCount = 0;
@@ -153,6 +175,142 @@ static const char* afStatusName(int status) {
   }
 }
 
+static float readCpuTempC() {
+#if HAS_LEGACY_TEMP_SENSOR
+  static bool initialized = false;
+  if (!initialized) {
+    temp_sensor_config_t cfg = TSENS_CONFIG_DEFAULT();
+    cfg.dac_offset = TSENS_DAC_L2;
+    if (temp_sensor_set_config(cfg) != ESP_OK) {
+      return NAN;
+    }
+    if (temp_sensor_start() != ESP_OK) {
+      return NAN;
+    }
+    initialized = true;
+  }
+  float temp_c = NAN;
+  if (temp_sensor_read_celsius(&temp_c) != ESP_OK) {
+    return NAN;
+  }
+  return temp_c;
+#else
+  return NAN;
+#endif
+}
+
+static void logRuntimeState(const char *tag) {
+#if ENABLE_CAMERA_LIFECYCLE_DEBUG
+  const float temp_c = readCpuTempC();
+  LOG.printf("[RUNTIME] %s uptime=%lu ms captures=%lu fb_get=%lu fb_return=%lu "
+             "last_get=%lu ms last_return=%lu ms mjpeg_stream=%d standby=%d "
+             "free_heap=%u free_psram=%u cpu_temp=",
+             tag,
+             (unsigned long)millis(),
+             (unsigned long)g_capture_count,
+             (unsigned long)g_fb_get_count,
+             (unsigned long)g_fb_return_count,
+             (unsigned long)g_last_fb_get_ms,
+             (unsigned long)g_last_fb_return_ms,
+             g_mjpeg_stream_active ? 1 : 0,
+             g_sensor_standby ? 1 : 0,
+             (unsigned)ESP.getFreeHeap(),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+  if (isnan(temp_c)) {
+    LOG.println("n/a");
+  } else {
+    LOG.printf("%.1f C\n", temp_c);
+  }
+#else
+  (void)tag;
+#endif
+}
+
+static bool setSensorStandby(bool standby) {
+#if ENABLE_SENSOR_STANDBY_AFTER_CAPTURE
+  sensor_t *s = esp_camera_sensor_get();
+  if (!s) {
+    LOG.printf("[CAM][STANDBY] %s failed: no sensor\n", standby ? "enter" : "wake");
+    return false;
+  }
+
+  const uint8_t value = standby ? 0x42 : 0x02;
+  const int rc = s->set_reg(s, 0x3008, 0xFF, value);
+  if (rc == 0) {
+    g_sensor_standby = standby;
+    LOG.printf("[CAM][STANDBY] %s ok reg=0x3008 value=0x%02X\n",
+               standby ? "enter" : "wake", value);
+    delay(standby ? SENSOR_STANDBY_SETTLE_MS : SENSOR_WAKE_SETTLE_MS);
+    logRuntimeState(standby ? "standby_entered" : "standby_woke");
+    return true;
+  }
+
+  LOG.printf("[CAM][STANDBY] %s failed rc=%d reg=0x3008 value=0x%02X\n",
+             standby ? "enter" : "wake", rc, value);
+  return false;
+#else
+  (void)standby;
+  return false;
+#endif
+}
+
+static void wakeSensorIfNeeded(const char *reason) {
+#if ENABLE_SENSOR_STANDBY_AFTER_CAPTURE
+  if (g_sensor_standby) {
+    LOG.printf("[CAM][STANDBY] wake requested reason=%s\n", reason);
+    setSensorStandby(false);
+  }
+#else
+  (void)reason;
+#endif
+}
+
+static camera_fb_t *cameraFbGetLogged(const char *tag) {
+  const int64_t start = esp_timer_get_time();
+  camera_fb_t *fb = esp_camera_fb_get();
+  const int64_t end = esp_timer_get_time();
+  g_last_fb_get_ms = (uint32_t)((end - start) / 1000);
+  ++g_fb_get_count;
+#if ENABLE_CAMERA_LIFECYCLE_DEBUG && ENABLE_FB_FRAME_LOG
+  LOG.printf("[FB][GET] tag=%s count=%lu elapsed=%.1f ms fb=%p len=%u format=%d "
+             "heap=%u psram=%u standby=%d mjpeg_stream=%d\n",
+             tag,
+             (unsigned long)g_fb_get_count,
+             (end - start) / 1000.0,
+             fb,
+             fb ? (unsigned)fb->len : 0,
+             fb ? fb->format : -1,
+             (unsigned)ESP.getFreeHeap(),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+             g_sensor_standby ? 1 : 0,
+             g_mjpeg_stream_active ? 1 : 0);
+#else
+  (void)tag;
+#endif
+  return fb;
+}
+
+static void cameraFbReturnLogged(camera_fb_t *fb, const char *tag) {
+  if (!fb) return;
+  const int64_t start = esp_timer_get_time();
+  esp_camera_fb_return(fb);
+  const int64_t end = esp_timer_get_time();
+  g_last_fb_return_ms = (uint32_t)((end - start) / 1000);
+  ++g_fb_return_count;
+#if ENABLE_CAMERA_LIFECYCLE_DEBUG && ENABLE_FB_FRAME_LOG
+  LOG.printf("[FB][RETURN] tag=%s count=%lu elapsed=%.1f ms fb=%p heap=%u psram=%u standby=%d\n",
+             tag,
+             (unsigned long)g_fb_return_count,
+             (end - start) / 1000.0,
+             fb,
+             (unsigned)ESP.getFreeHeap(),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+             g_sensor_standby ? 1 : 0);
+#else
+  (void)tag;
+#endif
+}
+
 // ---------- LED ----------
 static inline void led_init() {
   // Arduino-ESP32：ledcSetup(channel, freq, resolutionBits)
@@ -193,7 +351,7 @@ bool sd_begin_mhz(uint32_t mhz) {
   return false;
 }
 bool sd_init_fast() {
-  const uint32_t cand_mhz[] = {25, 20, 16, 12};
+  const uint32_t cand_mhz[] = {40, 32, 25, 20, 16, 12};
   for (size_t i=0;i<sizeof(cand_mhz)/sizeof(cand_mhz[0]);++i) {
     if (sd_begin_mhz(cand_mhz[i])) return true;
   }
@@ -203,8 +361,8 @@ bool sd_init_fast() {
 
 // ---------- 丟棄一幀 ----------
 static inline void discard_one_frame() {
-  camera_fb_t *fb = esp_camera_fb_get();
-  if (fb) esp_camera_fb_return(fb);
+  camera_fb_t *fb = cameraFbGetLogged("discard");
+  cameraFbReturnLogged(fb, "discard");
 }
 
 static bool autofocusReachedStableState(uint32_t timeout_ms, bool require_focused, bool pump_frames, uint8_t min_pump_frames, bool accept_after_min_pump) {
@@ -254,16 +412,13 @@ static bool autofocusReachedStableState(uint32_t timeout_ms, bool require_focuse
     }
 
     if (pump_frames) {
-      const int64_t t_pump_start = esp_timer_get_time();
-      camera_fb_t *fb = esp_camera_fb_get();
-      const int64_t t_pump_end = esp_timer_get_time();
+      camera_fb_t *fb = cameraFbGetLogged("af_pump");
       if (fb) {
         const size_t pump_len = fb->len;
-        esp_camera_fb_return(fb);
+        cameraFbReturnLogged(fb, "af_pump");
         ++pumped_frames;
 #if AF_DEBUG_WAIT_LOG
-        DBG_PRINTF("[AF][WAIT] pump frame %.1f ms len=%u\n",
-                   (t_pump_end - t_pump_start) / 1000.0, (unsigned)pump_len);
+        DBG_PRINTF("[AF][WAIT] pump frame len=%u\n", (unsigned)pump_len);
 #endif
       } else {
 #if AF_DEBUG_WAIT_LOG
@@ -694,10 +849,21 @@ static void warmupAndLockWhiteBalance(sensor_t *s) {
 // ---------- 拍照 + 存檔（LED 先穩定，丟 2 幀再拍） ----------
 void photo_save(const char *filePath) {
   const int64_t t_photo_start = esp_timer_get_time();
+  ++g_capture_count;
+  const uint32_t now_ms = millis();
+  const uint32_t interval_ms = g_last_capture_ms ? (now_ms - g_last_capture_ms) : 0;
+  g_last_capture_ms = now_ms;
+  LOG.printf("[CAP][INTERVAL] capture=%lu img=%d interval=%lu ms target=%lu ms\n",
+             (unsigned long)g_capture_count, imgCount,
+             (unsigned long)interval_ms, (unsigned long)(TARGET_PERIOD_S * 1000UL));
+  logRuntimeState("before_capture");
+  wakeSensorIfNeeded("capture_start");
+
   DBG_PRINTF("[CAP] begin img=%d path=%s sd_ready=%d af_ready=%d af_mode=%d\n",
              imgCount, filePath, g_sd_ready ? 1 : 0, g_af_ready ? 1 : 0, AF_LOCK_MODE);
   if (!g_sd_ready && !remountSdCard()) {
     LOG.println("[SD] unavailable, skip capture save");
+    setSensorStandby(true);
     return;
   }
 
@@ -712,6 +878,8 @@ void photo_save(const char *filePath) {
     LOG.println("[AF] capture skipped because focus was not confirmed");
     setLEDBrightness(0);
     releaseCaptureAutofocus();
+    setSensorStandby(true);
+    logRuntimeState("capture_skipped_af");
     return;
   }
 #else
@@ -728,20 +896,21 @@ void photo_save(const char *filePath) {
              CAPTURE_DISCARD_FRAMES, (t_discard_end - t_discard_start) / 1000.0);
 
   // 3) 正式取幀
-  const int64_t t_fb_start = esp_timer_get_time();
-  camera_fb_t *fb = esp_camera_fb_get();
+  camera_fb_t *fb = cameraFbGetLogged("final");
   int64_t t_got_fb = esp_timer_get_time();
   if (!fb) {
     LOG.println("[CAM] esp_camera_fb_get() failed");
     setLEDBrightness(0);
     releaseCaptureAutofocus();
+    setSensorStandby(true);
+    logRuntimeState("capture_failed_fb_get");
     return;
   }
 
   // 立刻把會用到的資料先存起來（避免 fb_return 後 use-after-free）
   const size_t img_len = fb->len;
-  DBG_PRINTF("[CAP] fb_get=%.1f ms len=%u bytes format=%d\n",
-             (t_got_fb - t_fb_start) / 1000.0, (unsigned)img_len, fb->format);
+  DBG_PRINTF("[CAP] fb_get=%lu ms len=%u bytes format=%d\n",
+             (unsigned long)g_last_fb_get_ms, (unsigned)img_len, fb->format);
 
   // 4) 關燈
   setLEDBrightness(0);
@@ -763,7 +932,7 @@ void photo_save(const char *filePath) {
   }
 
   // 6) 釋放影像緩衝
-  esp_camera_fb_return(fb);
+  cameraFbReturnLogged(fb, "final");
   int64_t t_after_fb_return = esp_timer_get_time();
 
   // 7) 時間資訊
@@ -778,6 +947,8 @@ void photo_save(const char *filePath) {
 
   if (ok) LOG.printf("[OK] Saved: %s\n", filePath);
   else    LOG.printf("[FAIL] Save failed: %s\n", filePath);
+  setSensorStandby(true);
+  logRuntimeState(ok ? "after_capture_saved" : "after_capture_save_failed");
   DBG_PRINTF("[CAP] total_elapsed=%.1f ms\n", (esp_timer_get_time() - t_photo_start) / 1000.0);
 
   delay(10);
@@ -844,6 +1015,7 @@ void setup() {
   recoverImageCounter();
 
   LOG.println("Continuous mode: capture (no sleep).");
+  logRuntimeState("setup_done");
 }
 
 void loop() {
