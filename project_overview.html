@@ -1,0 +1,881 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SpaceCellCam Interactive Overview</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f5f7f8;
+      --panel: #ffffff;
+      --ink: #1c2526;
+      --muted: #5d6a70;
+      --line: #d9e1e4;
+      --accent: #0f766e;
+      --accent-2: #b45309;
+      --ok: #137333;
+      --warn: #b45309;
+      --bad: #b91c1c;
+      --chip: #eef6f5;
+      --shadow: 0 10px 28px rgba(19, 35, 38, 0.08);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: "Segoe UI", "Noto Sans TC", Arial, sans-serif;
+      line-height: 1.5;
+    }
+
+    header {
+      background: #102a2d;
+      color: #f7fbfb;
+      border-bottom: 1px solid #0b2022;
+    }
+
+    .hero {
+      width: min(1180px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 34px 0 28px;
+      display: grid;
+      grid-template-columns: minmax(0, 1.25fr) minmax(300px, 0.75fr);
+      gap: 28px;
+      align-items: center;
+    }
+
+    h1, h2, h3 {
+      margin: 0;
+      letter-spacing: 0;
+    }
+
+    h1 {
+      font-size: clamp(2rem, 4vw, 3.45rem);
+      line-height: 1.05;
+      font-weight: 760;
+    }
+
+    .subtitle {
+      margin: 14px 0 0;
+      color: #c9dcdf;
+      max-width: 780px;
+      font-size: 1.03rem;
+    }
+
+    .status-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .status-tile {
+      border: 1px solid rgba(255, 255, 255, 0.16);
+      background: rgba(255, 255, 255, 0.07);
+      padding: 12px;
+      border-radius: 8px;
+      min-height: 78px;
+    }
+
+    .status-tile span {
+      display: block;
+      color: #b2c9cc;
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      margin-bottom: 6px;
+    }
+
+    .status-tile strong {
+      font-size: 1.1rem;
+      overflow-wrap: anywhere;
+    }
+
+    nav {
+      position: sticky;
+      top: 0;
+      z-index: 5;
+      background: rgba(245, 247, 248, 0.96);
+      border-bottom: 1px solid var(--line);
+      backdrop-filter: blur(10px);
+    }
+
+    .tabs {
+      width: min(1180px, calc(100% - 32px));
+      margin: 0 auto;
+      display: flex;
+      gap: 6px;
+      overflow-x: auto;
+      padding: 10px 0;
+    }
+
+    .tab {
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--muted);
+      padding: 9px 12px;
+      border-radius: 8px;
+      cursor: pointer;
+      font: inherit;
+      white-space: nowrap;
+    }
+
+    .tab[aria-selected="true"] {
+      background: var(--panel);
+      border-color: var(--line);
+      color: var(--ink);
+      box-shadow: 0 2px 8px rgba(19, 35, 38, 0.06);
+    }
+
+    main {
+      width: min(1180px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 24px 0 48px;
+    }
+
+    section {
+      display: none;
+    }
+
+    section.active {
+      display: block;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(12, 1fr);
+      gap: 16px;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      padding: 18px;
+    }
+
+    .span-4 { grid-column: span 4; }
+    .span-5 { grid-column: span 5; }
+    .span-6 { grid-column: span 6; }
+    .span-7 { grid-column: span 7; }
+    .span-8 { grid-column: span 8; }
+    .span-12 { grid-column: span 12; }
+
+    .panel h2 {
+      font-size: 1.28rem;
+      margin-bottom: 12px;
+    }
+
+    .panel h3 {
+      font-size: 1rem;
+      margin-bottom: 8px;
+    }
+
+    .muted {
+      color: var(--muted);
+    }
+
+    .flow {
+      display: grid;
+      grid-template-columns: 260px minmax(0, 1fr);
+      gap: 16px;
+    }
+
+    .step-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .step-button {
+      border: 1px solid var(--line);
+      background: #fbfdfd;
+      border-radius: 8px;
+      padding: 10px 12px;
+      text-align: left;
+      cursor: pointer;
+      font: inherit;
+      color: var(--ink);
+    }
+
+    .step-button.active {
+      border-color: var(--accent);
+      background: var(--chip);
+    }
+
+    .flow-detail {
+      min-height: 340px;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 260px;
+      gap: 16px;
+      align-items: stretch;
+    }
+
+    .diagram {
+      border: 1px solid var(--line);
+      background:
+        linear-gradient(90deg, rgba(15, 118, 110, 0.09) 1px, transparent 1px),
+        linear-gradient(0deg, rgba(15, 118, 110, 0.08) 1px, transparent 1px),
+        #f9fcfc;
+      background-size: 22px 22px;
+      border-radius: 8px;
+      padding: 16px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .board {
+      position: absolute;
+      inset: 62px 44px auto auto;
+      width: 150px;
+      height: 210px;
+      border-radius: 26px;
+      background: #19383b;
+      border: 3px solid #315a5e;
+      box-shadow: inset 0 0 0 10px rgba(255, 255, 255, 0.04);
+    }
+
+    .lens {
+      position: absolute;
+      left: 38px;
+      top: 74px;
+      width: 134px;
+      height: 134px;
+      border: 12px solid #dfe8e8;
+      border-radius: 50%;
+      background: radial-gradient(circle at 48% 46%, #061819 0 35%, #112d30 36% 60%, #26494d 61% 100%);
+      box-shadow: 0 0 0 10px rgba(15, 118, 110, 0.14);
+    }
+
+    .led-ring {
+      position: absolute;
+      left: 20px;
+      top: 56px;
+      width: 170px;
+      height: 170px;
+      border: 14px solid rgba(251, 191, 36, 0.66);
+      border-radius: 50%;
+      box-shadow: 0 0 24px rgba(251, 191, 36, 0.45);
+    }
+
+    .label {
+      position: absolute;
+      background: #ffffff;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px 10px;
+      font-size: 0.84rem;
+      box-shadow: 0 8px 18px rgba(19, 35, 38, 0.08);
+    }
+
+    .label.sensor { left: 34px; bottom: 24px; }
+    .label.sd { right: 28px; bottom: 26px; }
+    .label.uart { right: 22px; top: 24px; }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .metric {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      background: #fbfdfd;
+    }
+
+    .metric span {
+      display: block;
+      color: var(--muted);
+      font-size: 0.82rem;
+      margin-bottom: 4px;
+    }
+
+    code, pre {
+      font-family: Consolas, "Cascadia Mono", monospace;
+    }
+
+    code {
+      background: #edf3f4;
+      border: 1px solid #dce7e9;
+      border-radius: 6px;
+      padding: 1px 5px;
+      font-size: 0.92em;
+    }
+
+    pre {
+      margin: 0;
+      background: #102a2d;
+      color: #d9f7ef;
+      border-radius: 8px;
+      padding: 14px;
+      overflow: auto;
+      font-size: 0.86rem;
+      line-height: 1.45;
+    }
+
+    .param-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.94rem;
+    }
+
+    .param-table th,
+    .param-table td {
+      border-bottom: 1px solid var(--line);
+      padding: 10px 8px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    .param-table th {
+      color: var(--muted);
+      font-weight: 650;
+      background: #f8fbfb;
+    }
+
+    .risk {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border-radius: 999px;
+      padding: 3px 8px;
+      font-size: 0.82rem;
+      font-weight: 650;
+    }
+
+    .risk.low { background: #e8f5ed; color: var(--ok); }
+    .risk.mid { background: #fff4df; color: var(--warn); }
+    .risk.high { background: #fdeaea; color: var(--bad); }
+
+    .controls {
+      display: grid;
+      gap: 14px;
+    }
+
+    .control-row {
+      display: grid;
+      grid-template-columns: 210px minmax(0, 1fr) 70px;
+      gap: 12px;
+      align-items: center;
+    }
+
+    input[type="range"] {
+      width: 100%;
+      accent-color: var(--accent);
+    }
+
+    .estimate {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 16px;
+    }
+
+    .estimate strong {
+      font-size: 1.35rem;
+    }
+
+    textarea {
+      width: 100%;
+      min-height: 230px;
+      resize: vertical;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      font: 0.9rem Consolas, "Cascadia Mono", monospace;
+      color: var(--ink);
+      background: #fbfdfd;
+    }
+
+    .button-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 10px 0 0;
+    }
+
+    .action {
+      border: 1px solid var(--accent);
+      background: var(--accent);
+      color: #ffffff;
+      border-radius: 8px;
+      padding: 9px 12px;
+      cursor: pointer;
+      font: inherit;
+    }
+
+    .secondary {
+      background: #ffffff;
+      color: var(--accent);
+    }
+
+    .findings {
+      display: grid;
+      gap: 10px;
+      margin-top: 12px;
+    }
+
+    .finding {
+      border: 1px solid var(--line);
+      border-left: 5px solid var(--accent);
+      background: #ffffff;
+      border-radius: 8px;
+      padding: 10px 12px;
+    }
+
+    .finding.warn { border-left-color: var(--warn); }
+    .finding.bad { border-left-color: var(--bad); }
+
+    .wiring {
+      display: grid;
+      gap: 10px;
+    }
+
+    .wire {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 52px minmax(0, 1fr);
+      align-items: center;
+      gap: 10px;
+    }
+
+    .wire span {
+      border: 1px solid var(--line);
+      background: #fbfdfd;
+      border-radius: 8px;
+      padding: 10px;
+      min-height: 46px;
+    }
+
+    .wire b {
+      height: 3px;
+      background: var(--accent);
+      border-radius: 3px;
+    }
+
+    footer {
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      padding: 18px 0 32px;
+      width: min(1180px, calc(100% - 32px));
+      margin: 0 auto;
+      font-size: 0.9rem;
+    }
+
+    @media (max-width: 900px) {
+      .hero,
+      .flow,
+      .flow-detail {
+        grid-template-columns: 1fr;
+      }
+
+      .span-4,
+      .span-5,
+      .span-6,
+      .span-7,
+      .span-8,
+      .span-12 {
+        grid-column: 1 / -1;
+      }
+
+      .control-row,
+      .estimate {
+        grid-template-columns: 1fr;
+      }
+
+      .status-grid,
+      .metrics {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="hero">
+      <div>
+        <h1>SpaceCellCam</h1>
+        <p class="subtitle">XIAO ESP32S3 + OV5640 AF camera firmware for periodic LED-assisted QSXGA capture to microSD. This page turns the current firmware settings into an interactive project map.</p>
+      </div>
+      <div class="status-grid" aria-label="Current firmware status">
+        <div class="status-tile"><span>Capture</span><strong>QSXGA JPEG</strong></div>
+        <div class="status-tile"><span>AF mode</span><strong>Per-shot center AF</strong></div>
+        <div class="status-tile"><span>Storage</span><strong>/bXXX/image_N.jpg</strong></div>
+        <div class="status-tile"><span>Debug</span><strong>USB CDC + D6/D7 UART</strong></div>
+      </div>
+    </div>
+  </header>
+
+  <nav aria-label="Project sections">
+    <div class="tabs" role="tablist">
+      <button class="tab" role="tab" aria-selected="true" data-section="overview">Overview</button>
+      <button class="tab" role="tab" aria-selected="false" data-section="flow">Capture Flow</button>
+      <button class="tab" role="tab" aria-selected="false" data-section="params">Parameters</button>
+      <button class="tab" role="tab" aria-selected="false" data-section="tuning">Speed Tuning</button>
+      <button class="tab" role="tab" aria-selected="false" data-section="logs">Log Helper</button>
+      <button class="tab" role="tab" aria-selected="false" data-section="wiring">Wiring</button>
+    </div>
+  </nav>
+
+  <main>
+    <section id="overview" class="active">
+      <div class="grid">
+        <div class="panel span-7">
+          <h2>Project Role</h2>
+          <p>This firmware runs the XIAO ESP32S3 as a fixed-position imaging node. It turns on an LED, focuses the OV5640 module, captures a high-resolution JPEG, verifies the SD write, then waits for the next scheduled shot.</p>
+          <div class="metrics">
+            <div class="metric"><span>Period</span><strong>10 s</strong></div>
+            <div class="metric"><span>XCLK</span><strong>20 MHz</strong></div>
+            <div class="metric"><span>SD SPI</span><strong>25 / 20 / 16 / 12 MHz</strong></div>
+            <div class="metric"><span>AF release</span><strong>After every capture</strong></div>
+          </div>
+        </div>
+        <div class="panel span-5">
+          <h2>Hardware Map</h2>
+          <div class="diagram" style="height: 330px">
+            <div class="led-ring" aria-hidden="true"></div>
+            <div class="lens" aria-hidden="true"></div>
+            <div class="board" aria-hidden="true"></div>
+            <div class="label sensor">OV5640 AF camera</div>
+            <div class="label uart">D6 TX / D7 RX</div>
+            <div class="label sd">microSD SPI</div>
+          </div>
+        </div>
+        <div class="panel span-12">
+          <h2>Current Capture Contract</h2>
+          <pre><code>LED on -> 200 ms preheat -> center AF -> QVGA AF pump -> restore QSXGA
+-> 120 ms settle -> discard 2 frames -> capture JPEG -> LED off -> AF release -> SD verify</code></pre>
+        </div>
+      </div>
+    </section>
+
+    <section id="flow">
+      <div class="panel">
+        <h2>Capture Flow Explorer</h2>
+        <div class="flow">
+          <div class="step-list" id="stepList"></div>
+          <div class="flow-detail">
+            <div>
+              <h3 id="flowTitle"></h3>
+              <p id="flowText" class="muted"></p>
+              <pre><code id="flowCode"></code></pre>
+            </div>
+            <div class="diagram">
+              <div class="led-ring" aria-hidden="true"></div>
+              <div class="lens" aria-hidden="true"></div>
+              <div class="board" aria-hidden="true"></div>
+              <div class="label sensor" id="flowBadge">Capture</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="params">
+      <div class="panel">
+        <h2>Important Parameters</h2>
+        <table class="param-table">
+          <thead>
+            <tr><th>Macro</th><th>Current</th><th>Effect</th><th>Risk When Changed</th></tr>
+          </thead>
+          <tbody id="paramRows"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="tuning">
+      <div class="grid">
+        <div class="panel span-7">
+          <h2>Speed Tuning Simulator</h2>
+          <div class="controls">
+            <label class="control-row">
+              <span>Restore settle ms</span>
+              <input id="settle" type="range" min="0" max="200" step="10" value="120">
+              <output id="settleOut">120</output>
+            </label>
+            <label class="control-row">
+              <span>Discard frames</span>
+              <input id="discard" type="range" min="0" max="3" step="1" value="2">
+              <output id="discardOut">2</output>
+            </label>
+            <label class="control-row">
+              <span>AF pump frames</span>
+              <input id="pump" type="range" min="2" max="8" step="1" value="6">
+              <output id="pumpOut">6</output>
+            </label>
+            <label class="control-row">
+              <span>AF stable count</span>
+              <input id="stable" type="range" min="1" max="3" step="1" value="2">
+              <output id="stableOut">2</output>
+            </label>
+          </div>
+          <div class="estimate">
+            <div class="metric"><span>Estimated saved time</span><strong id="savedTime">0 ms</strong></div>
+            <div class="metric"><span>Stability risk</span><strong id="riskText">Low</strong></div>
+            <div class="metric"><span>Suggested action</span><strong id="suggestion">Baseline</strong></div>
+          </div>
+        </div>
+        <div class="panel span-5">
+          <h2>Recommended First Trial</h2>
+          <pre><code>#define CAPTURE_RESTORE_SETTLE_MS 50
+#define CAPTURE_DISCARD_FRAMES 1
+#define AF_PUMP_FRAME_COUNT 5
+#define AF_STABLE_COUNT 2</code></pre>
+          <p class="muted">Change only a small set of timing values, capture a short run, then compare image sharpness and log timings.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="logs">
+      <div class="grid">
+        <div class="panel span-7">
+          <h2>Log Helper</h2>
+          <textarea id="logInput" spellcheck="false">[CAP] begin img=23 path=/b000/image_23.jpg sd_ready=1 af_ready=1 af_mode=3
+[CAP][LED] on brightness=40 preheat=200 ms
+[AF][CAP] start tap-style center focus, status_before=112(idle)
+[AF][CAP] frame size switched for fast AF pump
+[AF] per-capture focus confirmed, elapsed=1213.0 ms, status=16(focused)
+[AF][CAP] frame size restored for QSXGA capture
+[CAP] discarded 2 frames in 1611.6 ms
+[CAP] fb_get=447.5 ms len=292703 bytes format=4
+[CAP][LED] off led_on_duration=3501.7 ms
+[AF] per-capture released
+[OK] Saved: /b000/image_23.jpg</textarea>
+          <div class="button-row">
+            <button class="action" id="analyzeLog">Analyze</button>
+            <button class="action secondary" id="loadBadLog">Load timeout example</button>
+          </div>
+        </div>
+        <div class="panel span-5">
+          <h2>Findings</h2>
+          <div id="findings" class="findings"></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="wiring">
+      <div class="grid">
+        <div class="panel span-6">
+          <h2>UART Debug Wiring</h2>
+          <div class="wiring">
+            <div class="wire"><span>XIAO D6 / GPIO43 / TX</span><b></b><span>Debug adapter RX</span></div>
+            <div class="wire"><span>XIAO D7 / GPIO44 / RX</span><b></b><span>Debug adapter TX</span></div>
+            <div class="wire"><span>XIAO GND</span><b></b><span>Debug adapter GND</span></div>
+          </div>
+        </div>
+        <div class="panel span-6">
+          <h2>Power Rule</h2>
+          <p>If the board is powered by a stable external supply, connect only TX, RX, and GND for UART logging. Avoid powering the XIAO from the PC USB port during image-capture tests if USB causes frame timeouts.</p>
+          <pre><code>Baud: 115200
+USB CDC: enabled
+Serial1: D6 TX, D7 RX</code></pre>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    Generated for the current SpaceCellCam firmware settings in src/main.cpp and platformio.ini.
+  </footer>
+
+  <script>
+    const flowSteps = [
+      {
+        title: "LED preheat",
+        badge: "LED",
+        text: "The capture LED turns on at brightness 40, then waits 200 ms before AF starts.",
+        code: "#define LED_BRIGHTNESS 40\n#define LED_PREHEAT_MS 200"
+      },
+      {
+        title: "Center AF",
+        badge: "AF zone",
+        text: "Each image triggers autofocus in a fixed center zone on the OV5640 AF grid.",
+        code: "#define AF_LOCK_MODE 3\n#define AF_CENTER_X 30\n#define AF_CENTER_Y 22\n#define AF_CENTER_W 20\n#define AF_CENTER_H 16"
+      },
+      {
+        title: "QVGA AF pump",
+        badge: "QVGA",
+        text: "The camera temporarily switches to QVGA so the AF firmware receives frames faster.",
+        code: "#define AF_SWITCH_FRAME_SIZE_FOR_PUMP 1\n#define AF_PUMP_FRAME_SIZE FRAMESIZE_QVGA\n#define AF_PUMP_FRAME_COUNT 6"
+      },
+      {
+        title: "Restore QSXGA",
+        badge: "QSXGA",
+        text: "After AF confirmation, the sensor switches back to QSXGA for the final JPEG capture.",
+        code: "#define CAPTURE_FRAME_SIZE FRAMESIZE_QSXGA\n#define CAPTURE_RESTORE_SETTLE_MS 120"
+      },
+      {
+        title: "Discard and capture",
+        badge: "JPEG",
+        text: "Two frames are discarded before the final JPEG frame is written to SD.",
+        code: "#define CAPTURE_DISCARD_FRAMES 2\nconfig.jpeg_quality = 10\nconfig.fb_count = 1"
+      },
+      {
+        title: "Save and release",
+        badge: "SD",
+        text: "The image is written through a temp file, verified by size, then AF is released.",
+        code: "#define AF_KEEP_LOCK_AFTER_CAPTURE 0\natomicWriteAndVerify(filePath, fb->buf, img_len, ...)"
+      }
+    ];
+
+    const params = [
+      ["TARGET_PERIOD_S", "10", "Seconds between scheduled captures.", "low"],
+      ["XCLK_FREQ_HZ", "20000000", "Camera clock. Faster frame delivery, but power integrity matters.", "mid"],
+      ["CAPTURE_RESTORE_SETTLE_MS", "120", "Wait after switching from QVGA back to QSXGA.", "mid"],
+      ["CAPTURE_DISCARD_FRAMES", "2", "Frames discarded before the final JPEG capture.", "mid"],
+      ["AF_CAPTURE_SETTLE_MS", "2500", "Maximum wait for per-shot AF.", "mid"],
+      ["AF_PUMP_FRAME_COUNT", "6", "QVGA frames used to help AF settle.", "mid"],
+      ["AF_STABLE_COUNT", "2", "Consecutive focused/idle checks required.", "high"],
+      ["AF_KEEP_LOCK_AFTER_CAPTURE", "0", "Release VCM after every shot.", "low"],
+      ["AF_DEBUG_WAIT_LOG", "0", "Suppress noisy AF pump logs.", "low"]
+    ];
+
+    const tabs = document.querySelectorAll(".tab");
+    const sections = document.querySelectorAll("main section");
+    tabs.forEach(tab => {
+      tab.addEventListener("click", () => {
+        tabs.forEach(item => item.setAttribute("aria-selected", "false"));
+        sections.forEach(section => section.classList.remove("active"));
+        tab.setAttribute("aria-selected", "true");
+        document.getElementById(tab.dataset.section).classList.add("active");
+      });
+    });
+
+    const stepList = document.getElementById("stepList");
+    const flowTitle = document.getElementById("flowTitle");
+    const flowText = document.getElementById("flowText");
+    const flowCode = document.getElementById("flowCode");
+    const flowBadge = document.getElementById("flowBadge");
+
+    function showStep(index) {
+      document.querySelectorAll(".step-button").forEach((button, i) => {
+        button.classList.toggle("active", i === index);
+      });
+      const step = flowSteps[index];
+      flowTitle.textContent = step.title;
+      flowText.textContent = step.text;
+      flowCode.textContent = step.code;
+      flowBadge.textContent = step.badge;
+    }
+
+    flowSteps.forEach((step, index) => {
+      const button = document.createElement("button");
+      button.className = "step-button";
+      button.type = "button";
+      button.textContent = `${index + 1}. ${step.title}`;
+      button.addEventListener("click", () => showStep(index));
+      stepList.appendChild(button);
+    });
+    showStep(0);
+
+    const paramRows = document.getElementById("paramRows");
+    params.forEach(([name, value, effect, risk]) => {
+      const row = document.createElement("tr");
+      row.innerHTML = `<td><code>${name}</code></td><td>${value}</td><td>${effect}</td><td><span class="risk ${risk}">${risk}</span></td>`;
+      paramRows.appendChild(row);
+    });
+
+    const sliders = {
+      settle: document.getElementById("settle"),
+      discard: document.getElementById("discard"),
+      pump: document.getElementById("pump"),
+      stable: document.getElementById("stable")
+    };
+
+    function updateTuning() {
+      const settle = Number(sliders.settle.value);
+      const discard = Number(sliders.discard.value);
+      const pump = Number(sliders.pump.value);
+      const stable = Number(sliders.stable.value);
+      document.getElementById("settleOut").textContent = settle;
+      document.getElementById("discardOut").textContent = discard;
+      document.getElementById("pumpOut").textContent = pump;
+      document.getElementById("stableOut").textContent = stable;
+
+      const saved = Math.max(0, 120 - settle) + Math.max(0, 2 - discard) * 450 + Math.max(0, 6 - pump) * 70 + Math.max(0, 2 - stable) * 90;
+      let risk = "Low";
+      let suggestion = "Baseline";
+      if (discard < 2 || pump < 6 || settle < 80) {
+        risk = "Medium";
+        suggestion = "Short test run";
+      }
+      if (stable < 2 || discard === 0 || pump < 4) {
+        risk = "High";
+        suggestion = "Inspect images";
+      }
+      document.getElementById("savedTime").textContent = `${Math.round(saved)} ms`;
+      document.getElementById("riskText").textContent = risk;
+      document.getElementById("suggestion").textContent = suggestion;
+    }
+
+    Object.values(sliders).forEach(slider => slider.addEventListener("input", updateTuning));
+    updateTuning();
+
+    const findings = document.getElementById("findings");
+    const logInput = document.getElementById("logInput");
+
+    function addFinding(text, kind = "") {
+      const item = document.createElement("div");
+      item.className = `finding ${kind}`;
+      item.textContent = text;
+      findings.appendChild(item);
+    }
+
+    function analyzeLog() {
+      const text = logInput.value;
+      findings.innerHTML = "";
+      if (/focus confirmed/.test(text)) {
+        addFinding("AF confirmed. Focus reached before capture.", "");
+      }
+      if (/did not stabilize/.test(text)) {
+        addFinding("AF did not stabilize. Check lighting, distance, or AF timeout.", "warn");
+      }
+      const discardMatch = text.match(/discarded\s+(\d+)\s+frames in\s+([\d.]+)\s+ms/i);
+      if (discardMatch) {
+        const ms = Number(discardMatch[2]);
+        if (ms > 3000) addFinding("Discard time is very long. This usually means camera frame delivery is stalled or power is unstable.", "bad");
+        else if (ms > 1500) addFinding("Discard time is slower than ideal. Watch for power or QSXGA restore stability.", "warn");
+        else addFinding("Discard timing looks normal.", "");
+      }
+      const fbMatch = text.match(/fb_get=([\d.]+)\s+ms/i);
+      if (fbMatch) {
+        const ms = Number(fbMatch[1]);
+        if (ms > 2000) addFinding("Final fb_get is slow. Check camera power and XCLK stability.", "warn");
+        else addFinding("Final fb_get timing looks reasonable.", "");
+      }
+      if (/esp_camera_fb_get\(\) failed/.test(text)) {
+        addFinding("Frame capture failed. Known causes: unstable USB power, camera timeout, or sensor not delivering QSXGA frames.", "bad");
+      }
+      if (/\[OK\] Saved/.test(text)) {
+        addFinding("SD write completed successfully.", "");
+      }
+      if (/write short|sync failed|verify size mismatch|write\+verify failed/.test(text)) {
+        addFinding("SD write or verification issue detected.", "bad");
+      }
+      if (!findings.children.length) {
+        addFinding("No known SpaceCellCam log pattern was detected.", "warn");
+      }
+    }
+
+    document.getElementById("analyzeLog").addEventListener("click", analyzeLog);
+    document.getElementById("loadBadLog").addEventListener("click", () => {
+      logInput.value = `[CAP] begin img=1 path=/b000/image_1.jpg sd_ready=1 af_ready=1 af_mode=3
+[CAP][LED] on brightness=40 preheat=200 ms
+[AF][CAP] start tap-style center focus, status_before=112(idle)
+[AF][CAP] frame size switched for fast AF pump
+[AF] per-capture focus confirmed, elapsed=2291.8 ms, status=16(focused)
+[AF][CAP] frame size restored for QSXGA capture
+[CAP] discarded 2 frames in 8280.5 ms
+[CAM] esp_camera_fb_get() failed
+[AF] per-capture released`;
+      analyzeLog();
+    });
+    analyzeLog();
+  </script>
+</body>
+</html>
