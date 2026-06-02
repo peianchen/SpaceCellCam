@@ -20,6 +20,7 @@
 #include "esp_heap_caps.h"
 #include <math.h>
 #include <stdarg.h>
+#include <string.h>
 #include <SdFat.h>
 #include "ov5640_af_support.h"
 
@@ -52,9 +53,11 @@
 #define LED_BRIGHTNESS    60         // LED 亮度（0~255）
 #define STATUS_LED_BRIGHTNESS 80     // 不接Serial時用補光LED顯示狀態
 #define ENABLE_DEBUG_LOG  1          // 1=印出詳細 debug log；0=只保留必要訊息
+#define ENABLE_DEBUG_MATE_LOG 1      // 1=Serial1/Debug Mate 顯示短狀態；USB CDC 仍顯示完整 log
 #define ENABLE_CAMERA_LIFECYCLE_DEBUG 1 // 1=記錄 fb_get/return、記憶體、溫度、standby 狀態
 #define ENABLE_FB_FRAME_LOG 0        // 1=每次 fb_get/return 都印；0=只保留 runtime count，避免 AF pump 洗版
 #define ENABLE_SENSOR_STANDBY_AFTER_CAPTURE 1 // 1=每次拍照後嘗試讓 OV5640 進入 standby
+#define COPY_FRAME_TO_PSRAM_BEFORE_SD 1 // 1=先複製 JPEG 並 fb_return/standby，再寫 SD，降低 sensor 工作時間
 #define SENSOR_STANDBY_SETTLE_MS 80  // 進入 standby 後等待時間
 #define SENSOR_WAKE_SETTLE_MS 120    // 從 standby 喚醒後等待時間
 #define AF_DEBUG_WAIT_LOG 0          // 1=印 AF wait/pump 細節；0=關閉，避免 Serial 輸出拖慢 AF
@@ -125,18 +128,15 @@ struct DualLogger {
   template <typename T>
   void print(const T &value) {
     Serial.print(value);
-    Serial1.print(value);
   }
 
   template <typename T>
   void println(const T &value) {
     Serial.println(value);
-    Serial1.println(value);
   }
 
   void println() {
     Serial.println();
-    Serial1.println();
   }
 
   int printf(const char *format, ...) {
@@ -146,6 +146,20 @@ struct DualLogger {
     const int written = vsnprintf(buffer, sizeof(buffer), format, args);
     va_end(args);
     Serial.print(buffer);
+    return written;
+  }
+
+  template <typename T>
+  void matePrintln(const T &value) {
+    Serial1.println(value);
+  }
+
+  int matePrintf(const char *format, ...) {
+    char buffer[96];
+    va_list args;
+    va_start(args, format);
+    const int written = vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
     Serial1.print(buffer);
     return written;
   }
@@ -159,6 +173,14 @@ DualLogger LOG;
 #else
 #define DBG_PRINTF(...)
 #define DBG_PRINTLN(x)
+#endif
+
+#if ENABLE_DEBUG_MATE_LOG
+#define DM_PRINTF(...) LOG.matePrintf(__VA_ARGS__)
+#define DM_PRINTLN(x) LOG.matePrintln(x)
+#else
+#define DM_PRINTF(...)
+#define DM_PRINTLN(x)
 #endif
 
 static const char* afStatusName(int status) {
@@ -240,6 +262,7 @@ static bool setSensorStandby(bool standby) {
     g_sensor_standby = standby;
     LOG.printf("[CAM][STANDBY] %s ok reg=0x3008 value=0x%02X\n",
                standby ? "enter" : "wake", value);
+    DM_PRINTLN(standby ? "STBY ON" : "WAKE");
     delay(standby ? SENSOR_STANDBY_SETTLE_MS : SENSOR_WAKE_SETTLE_MS);
     logRuntimeState(standby ? "standby_entered" : "standby_woke");
     return true;
@@ -346,6 +369,7 @@ bool sd_begin_mhz(uint32_t mhz) {
     g_sd_hz = mhz * 1000000UL;
     g_sd_ready = true;
     LOG.printf("[SD] mounted at %u MHz\n", (unsigned)mhz);
+    DM_PRINTF("SD %uM OK\n", (unsigned)mhz);
     return true;
   }
   return false;
@@ -556,8 +580,10 @@ static bool runCaptureAutofocus() {
     return false;
   }
   if (ov5640_af_stop()) {
+    const double af_elapsed_ms = (esp_timer_get_time() - t_af_start) / 1000.0;
     LOG.printf("[AF] per-capture focus confirmed, elapsed=%.1f ms, status=%d(%s)\n",
-                  (esp_timer_get_time() - t_af_start) / 1000.0, ov5640_af_status(), afStatusName(ov5640_af_status()));
+                  af_elapsed_ms, ov5640_af_status(), afStatusName(ov5640_af_status()));
+    DM_PRINTF("AF %.0fms\n", af_elapsed_ms);
     g_af_focus_locked = true;
     g_af_last_focus_img = imgCount;
   }
@@ -849,6 +875,8 @@ static void warmupAndLockWhiteBalance(sensor_t *s) {
 // ---------- 拍照 + 存檔（LED 先穩定，丟 2 幀再拍） ----------
 void photo_save(const char *filePath) {
   const int64_t t_photo_start = esp_timer_get_time();
+  const char *file_name = strrchr(filePath, '/');
+  file_name = file_name ? file_name + 1 : filePath;
   ++g_capture_count;
   const uint32_t now_ms = millis();
   const uint32_t interval_ms = g_last_capture_ms ? (now_ms - g_last_capture_ms) : 0;
@@ -856,6 +884,8 @@ void photo_save(const char *filePath) {
   LOG.printf("[CAP][INTERVAL] capture=%lu img=%d interval=%lu ms target=%lu ms\n",
              (unsigned long)g_capture_count, imgCount,
              (unsigned long)interval_ms, (unsigned long)(TARGET_PERIOD_S * 1000UL));
+  DM_PRINTF("CAP %s\n", file_name);
+  DM_PRINTF("INT %.1fs\n", interval_ms / 1000.0);
   logRuntimeState("before_capture");
   wakeSensorIfNeeded("capture_start");
 
@@ -863,6 +893,7 @@ void photo_save(const char *filePath) {
              imgCount, filePath, g_sd_ready ? 1 : 0, g_af_ready ? 1 : 0, AF_LOCK_MODE);
   if (!g_sd_ready && !remountSdCard()) {
     LOG.println("[SD] unavailable, skip capture save");
+    DM_PRINTLN("SD FAIL");
     setSensorStandby(true);
     return;
   }
@@ -876,6 +907,7 @@ void photo_save(const char *filePath) {
 #if ENABLE_AUTOFOCUS && (AF_LOCK_MODE == 3)
   if (!runCaptureAutofocus()) {
     LOG.println("[AF] capture skipped because focus was not confirmed");
+    DM_PRINTLN("AF FAIL");
     setLEDBrightness(0);
     releaseCaptureAutofocus();
     setSensorStandby(true);
@@ -900,6 +932,7 @@ void photo_save(const char *filePath) {
   int64_t t_got_fb = esp_timer_get_time();
   if (!fb) {
     LOG.println("[CAM] esp_camera_fb_get() failed");
+    DM_PRINTLN("FB FAIL");
     setLEDBrightness(0);
     releaseCaptureAutofocus();
     setSensorStandby(true);
@@ -915,27 +948,63 @@ void photo_save(const char *filePath) {
   // 4) 關燈
   setLEDBrightness(0);
   int64_t t_led_off = esp_timer_get_time();
-  DBG_PRINTF("[CAP][LED] off led_on_duration=%.1f ms\n", (t_led_off - t_led_on) / 1000.0);
+  const double led_on_ms = (t_led_off - t_led_on) / 1000.0;
+  DBG_PRINTF("[CAP][LED] off led_on_duration=%.1f ms\n", led_on_ms);
+  DM_PRINTF("LED %.0fms\n", led_on_ms);
   releaseCaptureAutofocus();
 
-  // 5) 寫入（原子）+ 驗證；失敗降速重掛一次
+#if COPY_FRAME_TO_PSRAM_BEFORE_SD
+  // 5) 先複製 JPEG，讓 camera frame buffer 可以立即歸還並讓 sensor 進 standby。
+  const int64_t t_copy_start = esp_timer_get_time();
+  uint8_t *image_copy = (uint8_t *)heap_caps_malloc(img_len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!image_copy) {
+    image_copy = (uint8_t *)heap_caps_malloc(img_len, MALLOC_CAP_8BIT);
+  }
+  const uint8_t *write_buf = fb->buf;
+  bool standby_already_entered = false;
+  if (image_copy) {
+    memcpy(image_copy, fb->buf, img_len);
+    const int64_t t_copy_end = esp_timer_get_time();
+    DBG_PRINTF("[CAP] copied JPEG to PSRAM in %.1f ms len=%u\n",
+               (t_copy_end - t_copy_start) / 1000.0, (unsigned)img_len);
+    write_buf = image_copy;
+    cameraFbReturnLogged(fb, "final");
+    fb = nullptr;
+    setSensorStandby(true);
+    standby_already_entered = true;
+  } else {
+    LOG.printf("[CAP] image copy alloc failed len=%u, fallback: standby after SD write\n", (unsigned)img_len);
+  }
+#else
+  const uint8_t *write_buf = fb->buf;
+  bool standby_already_entered = false;
+#endif
+
+  // 6) 寫入（原子）+ 驗證；失敗降速重掛一次
   double write_ms = 0.0, write_mbps = 0.0;
-  bool ok = atomicWriteAndVerify(filePath, fb->buf, img_len, &write_ms, &write_mbps);
+  bool ok = atomicWriteAndVerify(filePath, write_buf, img_len, &write_ms, &write_mbps);
   if (!ok) {
     LOG.println("[SD] write+verify failed, remount slower and retry once...");
     if (remountSdCard()) {
-      ok = atomicWriteAndVerify(filePath, fb->buf, img_len, &write_ms, &write_mbps);
+      ok = atomicWriteAndVerify(filePath, write_buf, img_len, &write_ms, &write_mbps);
     }
     if (!ok) {
       g_sd_ready = false;
     }
   }
 
-  // 6) 釋放影像緩衝
-  cameraFbReturnLogged(fb, "final");
+  // 7) 釋放影像緩衝或複製緩衝
+  if (fb) {
+    cameraFbReturnLogged(fb, "final");
+  }
+#if COPY_FRAME_TO_PSRAM_BEFORE_SD
+  if (image_copy) {
+    heap_caps_free(image_copy);
+  }
+#endif
   int64_t t_after_fb_return = esp_timer_get_time();
 
-  // 7) 時間資訊
+  // 8) 時間資訊
   (void)t_after_fb_return;
   double led_to_fb_ms    = (t_got_fb - t_led_on) / 1000.0;
   double fb_to_ledoff_ms = (t_led_off - t_got_fb) / 1000.0;
@@ -947,9 +1016,18 @@ void photo_save(const char *filePath) {
 
   if (ok) LOG.printf("[OK] Saved: %s\n", filePath);
   else    LOG.printf("[FAIL] Save failed: %s\n", filePath);
-  setSensorStandby(true);
+  DM_PRINTLN(ok ? "SAVE OK" : "SAVE FAIL");
+  const float temp_c = readCpuTempC();
+  if (!isnan(temp_c)) {
+    DM_PRINTF("TMP %.1fC\n", temp_c);
+  }
+  if (!standby_already_entered) {
+    setSensorStandby(true);
+  }
   logRuntimeState(ok ? "after_capture_saved" : "after_capture_save_failed");
-  DBG_PRINTF("[CAP] total_elapsed=%.1f ms\n", (esp_timer_get_time() - t_photo_start) / 1000.0);
+  const double total_elapsed_ms = (esp_timer_get_time() - t_photo_start) / 1000.0;
+  DBG_PRINTF("[CAP] total_elapsed=%.1f ms\n", total_elapsed_ms);
+  DM_PRINTF("TOT %.0fms\n", total_elapsed_ms);
 
   delay(10);
 }
@@ -958,6 +1036,8 @@ void setup() {
   LOG.begin(DEBUG_BAUD);
   delay(100);
   LOG.printf("[LOG] USB CDC + Serial1 enabled at %u baud (Serial1 RX=D7/GPIO44, TX=D6/GPIO43)\n", DEBUG_BAUD);
+  DM_PRINTLN("BOOT");
+  DM_PRINTF("UART %u\n", DEBUG_BAUD);
 
   SPI.begin();
 
@@ -1021,9 +1101,9 @@ void setup() {
 void loop() {
   static const uint32_t period_ms = TARGET_PERIOD_S * 1000UL;
 
-  // 用「絕對時間」排程：初始化 next_tick
+  // 用「絕對時間」排程：第一張立即拍，下一張對齊到 first_start + period。
   static uint32_t next_tick = 0;
-  if (next_tick == 0) next_tick = millis() + period_ms;
+  if (next_tick == 0) next_tick = millis();
 
   ++imgCount;
 
