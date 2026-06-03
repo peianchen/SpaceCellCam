@@ -1,106 +1,144 @@
 # SpaceCellCam
 
-Firmware for a Seeed Studio XIAO ESP32S3 + OV5640 AF camera that captures LED-assisted QSXGA JPEG images to microSD at a fixed interval.
+Firmware for Seeed Studio XIAO ESP32S3 + OV5640 AF camera. It captures LED-assisted QSXGA JPEG images to microSD every 10 seconds.
 
-Open `project_overview.html` for an interactive project overview.
+Open `project_overview.html` for an interactive overview.
 
-## Current Firmware Snapshot
+## Current Mode
 
-- Board: Seeed Studio XIAO ESP32S3.
-- Camera: OV5640 with AF / VCM support.
-- Capture size: `FRAMESIZE_QSXGA`.
-- Capture period: `TARGET_PERIOD_S = 10` seconds.
-- XCLK: `XCLK_FREQ_HZ = 20000000`.
-- LED: `LED_BRIGHTNESS = 60`, `LED_PREHEAT_MS = 200`.
-- SD card: SPI mode, tries `40 / 32 / 25 / 20 / 16 / 12 MHz`.
-- File layout: `/bXXX/image_<n>.jpg`, `BUCKET_SIZE = 500`.
-- Image counter is recovered from SD at boot, so reboot continues from the next image number.
-- USB CDC keeps the full debug log.
-- `Serial1` on `D6` / `D7` sends short Debug Mate status lines.
+Current firmware uses a focus-lock reuse mode with sensor standby:
+
+```cpp
+#define AF_LOCK_MODE      3
+#define AF_KEEP_LOCK_AFTER_CAPTURE 1
+#define AF_REFOCUS_EVERY_N 0
+#define ENABLE_SENSOR_STANDBY_AFTER_CAPTURE 1
+```
+
+Behavior:
+
+```text
+First capture: run center AF and stop/lock focus
+Later captures: reuse locked focus, do not run AF again
+Every capture: copy JPEG to PSRAM, fb_return, enter OV5640 standby, then write SD
+```
+
+Important interpretation: if you hear VCM movement on later captures, that does not necessarily mean the firmware is re-focusing. With this mode, logs should show `reuse locked focus`; standby/wake may still cause the VCM or AF driver to move back to the previous focus position.
+
+## Current Settings
+
+```cpp
+#define TARGET_PERIOD_S   10
+#define XCLK_FREQ_HZ      20000000
+#define CAPTURE_FRAME_SIZE FRAMESIZE_QSXGA
+#define CAPTURE_RESTORE_SETTLE_MS 50
+#define CAPTURE_DISCARD_FRAMES 1
+#define LED_PREHEAT_MS    300
+#define LED_BRIGHTNESS    80
+```
+
+AF region is a smaller center area to avoid LED ring/background influence:
+
+```cpp
+#define AF_CENTER_X       34
+#define AF_CENTER_Y       24
+#define AF_CENTER_W       12
+#define AF_CENTER_H       10
+```
+
+SD card speeds:
+
+```cpp
+40 / 32 / 25 / 20 / 16 / 12 MHz
+```
+
+Files are saved as:
+
+```text
+/bXXX/image_<n>.jpg
+```
+
+`BUCKET_SIZE = 500`, and image numbering is recovered from SD at boot to avoid overwriting old images.
 
 ## Capture Flow
 
 1. Wake OV5640 from standby if needed.
-2. Turn on LED at `LED_BRIGHTNESS = 60`.
-3. Wait `LED_PREHEAT_MS = 200`.
-4. Run per-capture center autofocus.
-5. Temporarily switch to QVGA for fast AF pump.
-6. Restore QSXGA and wait `CAPTURE_RESTORE_SETTLE_MS = 50`.
-7. Discard `CAPTURE_DISCARD_FRAMES = 1`.
-8. Capture final QSXGA JPEG.
-9. Turn off LED and release AF.
+2. Turn LED on at brightness 80.
+3. Wait 300 ms for LED/exposure stability.
+4. If focus is not locked yet, run tap-style center AF using QVGA pump frames.
+5. If focus is already locked, skip AF and reuse the previous focus state.
+6. Discard 1 frame.
+7. Capture final QSXGA JPEG.
+8. Turn LED off.
+9. Keep focus locked; do not release VCM in this mode.
 10. Copy JPEG to PSRAM.
-11. Return camera frame buffer and enter OV5640 standby.
-12. Write JPEG to SD with temp-file write, rename, and size verification.
+11. Return camera frame buffer.
+12. Enter OV5640 standby with register `0x3008 = 0x42`.
+13. Write copied JPEG to SD using temp-file write, rename, and size verification.
 
-This keeps LED exposure short and lets the camera sensor enter standby before the slower SD write completes.
+## What To Look For In Logs
 
-## Key Settings
+First capture should contain:
 
-```cpp
-#define TARGET_PERIOD_S   10
-#define CAPTURE_FRAME_SIZE FRAMESIZE_QSXGA
-#define CAPTURE_RESTORE_SETTLE_MS 50
-#define CAPTURE_DISCARD_FRAMES 1
-#define LED_PREHEAT_MS    200
-#define LED_BRIGHTNESS    60
+```text
+[AF][CAP] start tap-style center focus
+[AF] per-capture focus confirmed
+[AF] keep focus locked after capture
 ```
 
-```cpp
-#define ENABLE_AUTOFOCUS  1
-#define AF_LOCK_MODE      3
-#define AF_CAPTURE_SETTLE_MS 2500
-#define AF_PUMP_FRAME_SIZE FRAMESIZE_QVGA
-#define AF_PUMP_FRAME_COUNT 5
-#define AF_KEEP_LOCK_AFTER_CAPTURE 0
-#define AF_STABLE_COUNT   1
+Later captures should contain:
+
+```text
+[AF][CAP] reuse locked focus from img=...
+[AF] keep focus locked after capture
 ```
 
-```cpp
-#define ENABLE_SENSOR_STANDBY_AFTER_CAPTURE 1
-#define COPY_FRAME_TO_PSRAM_BEFORE_SD 1
-#define SENSOR_STANDBY_SETTLE_MS 80
-#define SENSOR_WAKE_SETTLE_MS 120
+If you see this, the firmware is not running a new AF search on that capture:
+
+```text
+[AF][CAP] reuse locked focus
 ```
 
-## Autofocus
+If you see this, the firmware is running a new AF search:
 
-The current mode is per-capture center AF:
-
-```cpp
-#define AF_CENTER_X       30
-#define AF_CENTER_Y       22
-#define AF_CENTER_W       20
-#define AF_CENTER_H       16
+```text
+[AF][CAP] start tap-style center focus
+[AF] per-capture focus confirmed
 ```
 
-`AF_LOCK_MODE = 3` means every image triggers AF again. `AF_KEEP_LOCK_AFTER_CAPTURE = 0` releases AF after each shot so the VCM is not held energized continuously. This is slower than keeping focus locked, but matches the current power and heating goal.
-
-AF wait-loop spam is disabled:
-
-```cpp
-#define AF_DEBUG_WAIT_LOG 0
-#define AF_DEBUG_EVERY_POLL 0
-```
-
-## Standby Behavior
-
-OV5640 standby is controlled by register `0x3008`:
-
-```cpp
-s->set_reg(s, 0x3008, 0xFF, 0x42); // standby
-s->set_reg(s, 0x3008, 0xFF, 0x02); // wake
-```
-
-Normal logs:
+Standby should still happen after each capture:
 
 ```text
 [CAM][STANDBY] enter ok reg=0x3008 value=0x42
 [RUNTIME] standby_entered ... standby=1
+```
+
+Wake should happen before the next capture:
+
+```text
 [CAM][STANDBY] wake ok reg=0x3008 value=0x02
 ```
 
-Because `COPY_FRAME_TO_PSRAM_BEFORE_SD = 1`, the camera frame buffer is returned and the sensor enters standby before SD writing. PSRAM should temporarily drop while holding the JPEG copy and return after save completes.
+## Verification: Reuse Lock vs Re-Focus
+
+To verify that later captures are not re-focusing:
+
+1. Put the target at distance A.
+2. Let the first image focus.
+3. Capture the second image without moving; it should be clear.
+4. Move the target to distance B before the next capture.
+5. Check the log and photo.
+
+Expected result if focus is truly reused:
+
+```text
+Log: [AF][CAP] reuse locked focus
+Photo at distance B: blurrier than distance A
+```
+
+If the target at distance B becomes clear while the log still says `reuse locked focus`, that is probably not firmware re-focus. It may be VCM/AF driver state recovery during standby/wake, or the scene may have enough depth of field that both distances look acceptable.
+
+For a stronger test, use a larger distance change or a slanted ruler/board so the focus plane is visible.
 
 ## Debug Mate UART
 
@@ -114,104 +152,69 @@ Baud                  ->  115200
 Level                 ->  3.3V UART
 ```
 
-If the XIAO is already powered from a stable external supply, connect only `TX`, `RX`, and `GND`. Do not feed 5V into UART pins.
+If the XIAO is externally powered, connect only `TX`, `RX`, and `GND`.
 
-Debug Mate receives short lines only:
+Debug Mate receives short status lines:
 
 ```text
 BOOT
 UART 115200
 SD 40M OK
-CAP image_63.jpg
+CAP image_5936.jpg
 INT 10.0s
 WAKE
-AF 1196ms
-LED 2089ms
+LED 665ms
 STBY ON
 SAVE OK
-TMP 33.5C
-TOT 2853ms
+TMP 36.5C
+TOT 1673ms
 ```
 
-USB CDC `Serial` still receives the full detailed log.
-
-## Normal Full Log Pattern
-
-```text
-[CAP][INTERVAL] capture=... img=... interval=10000 ms target=10000 ms
-[RUNTIME] before_capture ... standby=1 ...
-[CAM][STANDBY] wake ok reg=0x3008 value=0x02
-[CAP][LED] on brightness=60 preheat=200 ms
-[AF][CAP] start tap-style center focus
-[AF][CAP] frame size switched for fast AF pump
-[AF] per-capture focus confirmed, elapsed=...
-[AF][CAP] frame size restored for QSXGA capture
-[CAP] discarded 1 frames in ...
-[CAP] fb_get=447 ms len=... bytes format=4
-[CAP][LED] off led_on_duration=...
-[AF] per-capture released
-[CAP] copied JPEG to PSRAM in ...
-[CAM][STANDBY] enter ok reg=0x3008 value=0x42
-[OK] Saved: /b000/image_...
-[RUNTIME] after_capture_saved ... standby=1 ...
-```
-
-To confirm the camera is idle between captures, check that `fb_get` does not increase between `after_capture_saved` and the next `before_capture`, and that `mjpeg_stream=0`.
+USB CDC still receives the full log.
 
 ## Timing Expectations
 
-Recent normal values:
+With focus reuse:
 
-- `INT`: about `10.0s`.
-- AF: about `1.1~1.3s`.
-- LED on duration: about `2.0~2.1s`.
-- JPEG copy to PSRAM: about `12ms`.
-- SD write at 40 MHz: about `0.45s` for a 0.25 MB JPEG.
-- Total capture work: about `2.8s`.
+```text
+LED on duration: about 0.65 s
+Total capture work: about 1.6 - 1.8 s
+INT: about 10.0 s
+```
 
-First capture after boot may have different interval display. From the second capture onward, `INT` should be close to 10 seconds unless a failure or blocking operation delays the loop.
+With every-shot AF:
+
+```text
+LED on duration: about 2.1 s
+Total capture work: about 3.1 s
+```
+
+SD write currently happens after LED off and after sensor standby, so SD time affects total work but not illumination time.
+
+## Standby And Heat
+
+The current mode keeps the firmware focus lock but still puts OV5640 into standby every shot. This is the current compromise:
+
+```text
+Less LED time than every-shot AF
+Sensor standby still active
+No AF search on later captures
+VCM may still make a movement sound during wake/recovery
+```
+
+CPU temperature in logs is ESP32-S3 internal temperature, not OV5640 or VCM temperature.
 
 ## Power Notes
 
-Unstable USB power or noisy PC USB connections can cause camera frame timeouts, corrupted-looking JPEGs, slow discard frames, or `esp_camera_fb_get()` failure.
-
-Known symptoms:
-
-```text
-[CAP] discarded 1 frames in 8000+ ms
-[CAM] esp_camera_fb_get() failed
-```
-
-For capture testing, use a stable external power source. If logs are needed without PC USB power, use Debug Mate UART on `D6` / `D7`.
-
-## Speed Tuning
-
-Current conservative-fast settings:
-
-```cpp
-#define CAPTURE_RESTORE_SETTLE_MS 50
-#define CAPTURE_DISCARD_FRAMES 1
-#define AF_PUMP_FRAME_COUNT 5
-#define AF_STABLE_COUNT 1
-```
-
-Possible further tests:
-
-1. `CAPTURE_RESTORE_SETTLE_MS 50 -> 20`
-2. `SENSOR_WAKE_SETTLE_MS 120 -> 80`
-3. `CAPTURE_DISCARD_FRAMES 1 -> 0`
-
-Do not change many timing values at once. Capture a short run, compare images, and check `INT`, `AF`, `LED`, `STBY`, and `TOT` on Debug Mate.
+Unstable USB power can cause frame timeouts, corrupted images, long discard times, or `esp_camera_fb_get()` failure. For capture tests, use stable external power and Debug Mate UART instead of relying on PC USB power.
 
 ## Build
-
-Use PlatformIO:
 
 ```powershell
 C:\Users\chen8\.platformio\penv\Scripts\pio.exe run
 ```
 
-Project target:
+Target:
 
 ```ini
 [env:seeed-xiao-esp32-s3]
@@ -223,32 +226,31 @@ monitor_speed = 115200
 
 ## Troubleshooting
 
-AF issue:
+AF failure:
 
 ```text
 [AF] capture skipped because focus was not confirmed
 ```
 
-Camera frame issue:
+Frame failure:
 
 ```text
 [CAM] esp_camera_fb_get() failed
 ```
 
-SD issue:
+SD failure:
 
 ```text
 [SD] write short
 [SD] sync failed
 [SD] verify size mismatch
-[SD] write+verify failed
 ```
 
 Memory check:
 
 ```text
-[RUNTIME] standby_entered ... free_psram=713xxxx
+[RUNTIME] standby_entered ... free_psram=718xxxx
 [RUNTIME] after_capture_saved ... free_psram=7402739
 ```
 
-The lower value during `standby_entered` is expected while the copied JPEG is still held for SD writing. It should return after save completes.
+The temporary PSRAM drop is expected while the JPEG copy is waiting for SD write. It should recover after save completes.

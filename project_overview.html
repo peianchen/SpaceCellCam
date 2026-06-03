@@ -263,7 +263,7 @@
     <div class="hero">
       <div>
         <h1>SpaceCellCam</h1>
-        <p class="subtitle">XIAO ESP32S3 + OV5640 AF camera firmware for fixed-period LED-assisted QSXGA capture to microSD, with early sensor standby and short Debug Mate UART status.</p>
+        <p class="subtitle">XIAO ESP32S3 + OV5640 AF camera firmware for fixed-period QSXGA capture, using first-shot AF, later focus reuse, sensor standby, and short Debug Mate UART status.</p>
       </div>
       <div class="status-grid">
         <div class="status-tile"><span>Period</span><strong>10 s</strong></div>
@@ -290,10 +290,10 @@
       <div class="grid">
         <div class="panel span-7">
           <h2>Current Behavior</h2>
-          <p>The firmware wakes the OV5640, turns on the LED, runs per-shot center AF, captures a QSXGA JPEG, copies it to PSRAM, returns the camera frame buffer, enters sensor standby, then writes the copied JPEG to SD.</p>
+          <p>The firmware wakes the OV5640, turns on the LED, runs AF on the first unlocked shot, then reuses the locked focus on later shots. Each capture still copies the JPEG to PSRAM, returns the frame buffer, enters sensor standby, then writes the copied JPEG to SD.</p>
           <div class="metric-grid">
-            <div class="metric"><span>LED</span><strong>60 / 200 ms preheat</strong></div>
-            <div class="metric"><span>AF</span><strong>QVGA pump, 5 frames</strong></div>
+            <div class="metric"><span>LED</span><strong>80 / 300 ms preheat</strong></div>
+            <div class="metric"><span>AF</span><strong>first shot AF, then reuse</strong></div>
             <div class="metric"><span>Standby</span><strong>0x3008 = 0x42</strong></div>
           </div>
         </div>
@@ -302,15 +302,14 @@
           <pre><code>BOOT
 UART 115200
 SD 40M OK
-CAP image_63.jpg
+CAP image_5936.jpg
 INT 10.0s
 WAKE
-AF 1196ms
-LED 2089ms
+LED 665ms
 STBY ON
 SAVE OK
-TMP 33.5C
-TOT 2853ms</code></pre>
+TMP 36.5C
+TOT 1673ms</code></pre>
         </div>
       </div>
     </section>
@@ -342,7 +341,7 @@ TOT 2853ms</code></pre>
     <section id="tuning">
       <div class="grid">
         <div class="panel span-7">
-          <h2>Speed Tuning Simulator</h2>
+          <h2>Timing Simulator</h2>
           <div class="controls">
             <label class="control-row"><span>Restore settle ms</span><input id="settle" type="range" min="0" max="100" step="10" value="50"><output id="settleOut">50</output></label>
             <label class="control-row"><span>Discard frames</span><input id="discard" type="range" min="0" max="2" step="1" value="1"><output id="discardOut">1</output></label>
@@ -356,13 +355,13 @@ TOT 2853ms</code></pre>
           </div>
         </div>
         <div class="panel span-5">
-          <h2>Lower-Risk Trials</h2>
+          <h2>Mode Notes</h2>
           <pre><code>#define CAPTURE_RESTORE_SETTLE_MS 20
 #define SENSOR_WAKE_SETTLE_MS 80
 
 // Higher risk:
 #define CAPTURE_DISCARD_FRAMES 0</code></pre>
-          <p class="muted">Change one value at a time, then compare sharpness, corrupted frames, `INT`, `AF`, `LED`, and `TOT`.</p>
+          <p class="muted">The largest speed gain already comes from `AF_KEEP_LOCK_AFTER_CAPTURE = 1`: later shots skip AF search. Validate focus by moving the target and confirming the log still says `reuse locked focus`.</p>
         </div>
       </div>
     </section>
@@ -371,18 +370,19 @@ TOT 2853ms</code></pre>
       <div class="grid">
         <div class="panel span-7">
           <h2>Log Helper</h2>
-          <textarea id="logInput" spellcheck="false">[CAP][INTERVAL] capture=5 img=63 interval=10000 ms target=10000 ms
-[RUNTIME] before_capture uptime=49188 ms captures=5 fb_get=67 fb_return=67 last_get=447 ms last_return=0 ms mjpeg_stream=0 standby=1 free_heap=340644 free_psram=7402739 cpu_temp=32.5 C
+          <textarea id="logInput" spellcheck="false">[CAP][INTERVAL] capture=3 img=5936 interval=10000 ms target=10000 ms
+[RUNTIME] before_capture uptime=30150 ms captures=3 fb_get=25 fb_return=25 last_get=364 ms last_return=0 ms mjpeg_stream=0 standby=1 free_heap=340644 free_psram=7402739 cpu_temp=36.5 C
 [CAM][STANDBY] wake ok reg=0x3008 value=0x02
-[CAP][LED] on brightness=60 preheat=200 ms
-[AF] per-capture focus confirmed, elapsed=1196.8 ms, status=16(focused)
-[CAP] discarded 1 frames in 175.2 ms
-[CAP] fb_get=447 ms len=267211 bytes format=4
-[CAP][LED] off led_on_duration=2088.9 ms
-[CAP] copied JPEG to PSRAM in 12.2 ms len=267211
+[CAP][LED] on brightness=80 preheat=300 ms
+[AF][CAP] reuse locked focus from img=5934, current=5936
+[CAP] discarded 1 frames in 0.6 ms
+[CAP] fb_get=364 ms len=223973 bytes format=4
+[CAP][LED] off led_on_duration=664.5 ms
+[AF] keep focus locked after capture
+[CAP] copied JPEG to PSRAM in 10.2 ms len=223973
 [CAM][STANDBY] enter ok reg=0x3008 value=0x42
-[OK] Saved: /b000/image_63.jpg
-[RUNTIME] after_capture_saved uptime=52030 ms captures=5 fb_get=82 fb_return=82 last_get=447 ms last_return=0 ms mjpeg_stream=0 standby=1 free_heap=340644 free_psram=7402739 cpu_temp=33.5 C</textarea>
+[OK] Saved: /b011/image_5936.jpg
+[RUNTIME] after_capture_saved uptime=31822 ms captures=3 fb_get=27 fb_return=27 last_get=364 ms last_return=0 ms mjpeg_stream=0 standby=1 free_heap=340644 free_psram=7402739 cpu_temp=36.5 C</textarea>
           <div class="button-row">
             <button class="action" id="analyzeLog">Analyze</button>
             <button class="action secondary" id="loadBadLog">Load failure example</button>
@@ -423,10 +423,10 @@ D7 RX -> Debug Mate TX</code></pre>
   <script>
     const flowSteps = [
       ["Wake sensor", "Before each capture, standby is cleared with OV5640 register 0x3008 = 0x02.", "wakeSensorIfNeeded(\"capture_start\");"],
-      ["LED preheat", "The LED turns on at brightness 60 and waits 200 ms before AF.", "#define LED_BRIGHTNESS 60\n#define LED_PREHEAT_MS 200"],
-      ["Center AF", "Each shot runs tap-style center AF and releases the VCM after capture.", "#define AF_LOCK_MODE 3\n#define AF_KEEP_LOCK_AFTER_CAPTURE 0"],
-      ["QVGA pump", "The firmware switches to QVGA so AF can receive frames faster.", "#define AF_PUMP_FRAME_SIZE FRAMESIZE_QVGA\n#define AF_PUMP_FRAME_COUNT 5"],
-      ["QSXGA capture", "After AF, the firmware restores QSXGA, discards one frame, then captures the final JPEG.", "#define CAPTURE_RESTORE_SETTLE_MS 50\n#define CAPTURE_DISCARD_FRAMES 1\nconfig.fb_count = 1"],
+      ["LED preheat", "The LED turns on at brightness 80 and waits 300 ms before capture/AF.", "#define LED_BRIGHTNESS 80\n#define LED_PREHEAT_MS 300"],
+      ["First-shot AF", "When focus is not locked yet, the firmware runs tap-style center AF.", "#define AF_LOCK_MODE 3\n#define AF_CENTER_X 34\n#define AF_CENTER_Y 24\n#define AF_CENTER_W 12\n#define AF_CENTER_H 10"],
+      ["Reuse lock", "After a successful AF stop, later captures skip AF search and reuse the locked focus state.", "#define AF_KEEP_LOCK_AFTER_CAPTURE 1\n#define AF_REFOCUS_EVERY_N 0"],
+      ["QSXGA capture", "The firmware discards one frame, then captures the final QSXGA JPEG.", "#define CAPTURE_RESTORE_SETTLE_MS 50\n#define CAPTURE_DISCARD_FRAMES 1\nconfig.fb_count = 1"],
       ["Early standby", "The JPEG is copied to PSRAM, fb_return is called, then OV5640 enters standby before SD write.", "#define COPY_FRAME_TO_PSRAM_BEFORE_SD 1\nsetSensorStandby(true);"],
       ["SD save", "The copied JPEG is written through a temp file, renamed, and verified by size.", "atomicWriteAndVerify(filePath, write_buf, img_len, ...)"]
     ];
@@ -436,9 +436,11 @@ D7 RX -> Debug Mate TX</code></pre>
       ["XCLK_FREQ_HZ", "20000000", "OV5640 clock.", "mid"],
       ["CAPTURE_RESTORE_SETTLE_MS", "50", "Wait after QVGA -> QSXGA restore.", "mid"],
       ["CAPTURE_DISCARD_FRAMES", "1", "Frames discarded before final JPEG.", "mid"],
-      ["LED_BRIGHTNESS", "60", "Capture LED PWM brightness.", "low"],
+      ["LED_BRIGHTNESS", "80", "Capture LED PWM brightness.", "low"],
+      ["LED_PREHEAT_MS", "300", "LED/exposure warmup before capture.", "low"],
       ["AF_CAPTURE_SETTLE_MS", "2500", "Maximum per-shot AF wait.", "mid"],
       ["AF_PUMP_FRAME_COUNT", "5", "QVGA frames used during AF.", "mid"],
+      ["AF_KEEP_LOCK_AFTER_CAPTURE", "1", "Reuse locked focus after first successful AF.", "mid"],
       ["AF_STABLE_COUNT", "1", "Focused checks required.", "high"],
       ["COPY_FRAME_TO_PSRAM_BEFORE_SD", "1", "Early fb_return and sensor standby.", "mid"],
       ["ENABLE_DEBUG_MATE_LOG", "1", "Short Serial1 status lines.", "low"]
@@ -538,6 +540,7 @@ D7 RX -> Debug Mate TX</code></pre>
         if (Math.abs(ms - 10000) <= 100) addFinding("Capture interval is close to 10 seconds.");
         else addFinding(`Capture interval is ${ms} ms, not close to 10 seconds.`, "warn");
       }
+      if (/reuse locked focus/.test(text)) addFinding("Focus is reused; firmware did not run a new AF search.");
       if (/focus confirmed/.test(text)) addFinding("AF confirmed before final capture.");
       if (/did not stabilize|AF FAIL/.test(text)) addFinding("AF did not stabilize.", "warn");
       const discard = text.match(/discarded\s+(\d+)\s+frames in\s+([\d.]+)\s+ms/i);
@@ -550,6 +553,7 @@ D7 RX -> Debug Mate TX</code></pre>
       if (fb && Number(fb[1]) > 2000) addFinding("Final fb_get is slow.", "warn");
       if (/copied JPEG to PSRAM/.test(text)) addFinding("JPEG copy path is active.");
       if (/standby_entered|STBY ON/.test(text)) addFinding("OV5640 standby path is active.");
+      if (/reuse locked focus/.test(text) && /wake ok/.test(text)) addFinding("Reuse-lock plus standby/wake mode detected. VCM sound may be recovery, not AF search.");
       if (/\[OK\] Saved|SAVE OK/.test(text)) addFinding("SD save completed.");
       if (/write short|sync failed|verify size mismatch|SAVE FAIL/.test(text)) addFinding("SD write or verification issue detected.", "bad");
       if (!findings.children.length) addFinding("No known SpaceCellCam log pattern was detected.", "warn");

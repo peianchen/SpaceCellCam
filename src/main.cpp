@@ -1,13 +1,16 @@
 /*******************************************************
- * XIAO ESP32S3 + Camera → SD（常駐版，無休眠，分桶｜LED 用 LEDC 穩定 PWM）
- * - 固定週期：LED 預熱 → 丟棄兩幀 → 拍照 → SD 寫入(atomic) → 驗證
+ * XIAO ESP32S3 + OV5640 AF → microSD（固定週期拍照｜LED 用 LEDC 穩定 PWM）
+ * - 固定週期：喚醒 sensor → LED 預熱 → 首張 AF / 後續 reuse lock → 丟幀 → 拍照 → standby → SD 寫入
  * - 分桶：/bXXX/image_<count>.jpg（每 BUCKET_SIZE 張分一桶）
  * - 關鍵：單緩衝 + WHEN_EMPTY（避免 LED 未穩定時就開始曝光造成上半部偏暗）
+ * - 目前折衷模式：AF_KEEP_LOCK_AFTER_CAPTURE=1 且 standby=1。
+ *   第一張會真正 AF；後續程式不重新 AF，而是 reuse lock。standby/wake 時 VCM 可能會有回位動作聲。
  *
  * 修正：
  * (1) 避免 analogWrite 與 camera LEDC 衝突：改用 LEDC(獨立 channel/timer)
  * (2) 修正排程 overrun 判定：只在落後超過 1 個週期才 skip（加容忍）
  * (3) 修正 use-after-free：fb return 前先存 fb->len 等資訊
+ * (4) final JPEG 先複製到 PSRAM，再 fb_return + OV5640 standby，降低 sensor 工作時間
  *
  * 曝光模式：
  * EXPOSURE_MODE = 0: 自動曝光/自動增益
@@ -63,7 +66,7 @@
 #define AF_DEBUG_WAIT_LOG 0          // 1=印 AF wait/pump 細節；0=關閉，避免 Serial 輸出拖慢 AF
 #define AF_DEBUG_EVERY_POLL 0        // 1=每次 AF 輪詢都印 status，只有 AF_DEBUG_WAIT_LOG=1 時有效
 #define ENABLE_AUTOFOCUS  1          // 只在 OV5640 + AF 模組時生效
-#define AF_LOCK_MODE      3          // 0=關AF  1=setup後stop鎖焦  2=setup後release  3=每張中心single AF後release
+#define AF_LOCK_MODE      3          // 0=關AF  1=setup後stop鎖焦  2=setup後release  3=拍照時中心single AF/reuse lock
 #define AF_LED_PREHEAT_MS 50         // AF 補光預熱，獨立於正式拍照補光
 #define AF_LED_BRIGHTNESS 24         // AF 補光亮度，降低對樣本的影響
 #define AF_SETUP_SETTLE_MS 800       // setup single AF 最多等待時間
@@ -71,18 +74,14 @@
 #define AF_PUMP_FRAME_SIZE FRAMESIZE_QVGA
 #define AF_SWITCH_FRAME_SIZE_FOR_PUMP 1 // 1=AF pump 先切 QVGA，加快對焦；拍照前切回 QSXGA
 #define AF_PUMP_FRAME_COUNT 5        // AF 時快速出幾張低解析度 frame 讓韌體判斷
-#define AF_KEEP_LOCK_AFTER_CAPTURE 1 // 0=每張拍完 release，下張重新對焦；1=拍完不 release
+#define AF_KEEP_LOCK_AFTER_CAPTURE 1 // 0=每張拍完 release，下張重新AF；1=成功後不release，後續reuse lock
 #define AF_REFOCUS_EVERY_N 0         // 0=成功後不週期重對焦；>0=每 N 張重對焦一次
 #define AF_POLL_MS        25         // AF 狀態輪詢間隔
 #define AF_STABLE_COUNT   1          // 連續幾次 focused 才視為已對焦
-/*#define AF_CENTER_X       30         // OV5640 AF grid: 0~79
-#define AF_CENTER_Y       22         // OV5640 AF grid: 0~59
-#define AF_CENTER_W       20
-#define AF_CENTER_H       168*/
-#define AF_CENTER_X 34
-#define AF_CENTER_Y 24
-#define AF_CENTER_W 12
-#define AF_CENTER_H 10
+#define AF_CENTER_X       34         // OV5640 AF grid: 0~79；縮小中心區，避開 LED 環與背景干擾
+#define AF_CENTER_Y       24         // OV5640 AF grid: 0~59
+#define AF_CENTER_W       12
+#define AF_CENTER_H       10
 #define AWB_WARMUP_FRAMES 8          // 開機時在LED光源下讓AWB收斂的幀數
 #define WB_MODE           0          // 0=Auto  1=Sunny  2=Cloudy  3=Office  4=Home
 #define ENABLE_AWB_LOCK   0          // 0=持續自動白平衡；1=warmup後鎖定
@@ -876,7 +875,7 @@ static void warmupAndLockWhiteBalance(sensor_t *s) {
   setLEDBrightness(0);
 }
 
-// ---------- 拍照 + 存檔（LED 先穩定，丟 2 幀再拍） ----------
+// ---------- 拍照 + 存檔（LED 穩定、首張 AF/後續 reuse lock、丟 1 幀、早期 standby、寫 SD） ----------
 void photo_save(const char *filePath) {
   const int64_t t_photo_start = esp_timer_get_time();
   const char *file_name = strrchr(filePath, '/');
