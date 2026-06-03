@@ -71,7 +71,7 @@
 #define AF_PUMP_FRAME_SIZE FRAMESIZE_QVGA
 #define AF_SWITCH_FRAME_SIZE_FOR_PUMP 1 // 1=AF pump 先切 QVGA，加快對焦；拍照前切回 QSXGA
 #define AF_PUMP_FRAME_COUNT 5        // AF 時快速出幾張低解析度 frame 讓韌體判斷
-#define AF_KEEP_LOCK_AFTER_CAPTURE 0 // 0=每張拍完 release，下張重新對焦；1=拍完不 release
+#define AF_KEEP_LOCK_AFTER_CAPTURE 1 // 0=每張拍完 release，下張重新對焦；1=拍完不 release
 #define AF_REFOCUS_EVERY_N 0         // 0=成功後不週期重對焦；>0=每 N 張重對焦一次
 #define AF_POLL_MS        25         // AF 狀態輪詢間隔
 #define AF_STABLE_COUNT   1          // 連續幾次 focused 才視為已對焦
