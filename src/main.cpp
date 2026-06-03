@@ -48,12 +48,12 @@
 #define DEBUG_BAUD        115200
 #define SD_CS             21         // SD CS 腳位
 #define BUCKET_SIZE       500        // 每個資料夾最多檔案數
-#define XCLK_FREQ_HZ      20000000   // OV5640 常用 20 MHz；若仍出現壞圖再降 10 MHz
+#define XCLK_FREQ_HZ      10000000   // OV5640 常用 20 MHz；若仍出現壞圖再降 10 MHz
 #define CAPTURE_FRAME_SIZE FRAMESIZE_QSXGA
 #define CAPTURE_RESTORE_SETTLE_MS 50 // AF 從 QVGA 切回 QSXGA 後，先讓 sensor/JPEG 穩定
 #define CAPTURE_DISCARD_FRAMES 1     // 正式拍照前丟幾幀；2 較穩但 LED 會多亮約 1~3 秒
 #define LED_PREHEAT_MS    300        // LED 預熱
-#define LED_BRIGHTNESS    80         // LED 亮度（0~255）
+#define LED_BRIGHTNESS    60         // LED 亮度（0~255）
 #define STATUS_LED_BRIGHTNESS 100     // 不接Serial時用補光LED顯示狀態
 #define ENABLE_DEBUG_LOG  1          // 1=印出詳細 debug log；0=只保留必要訊息
 #define ENABLE_DEBUG_MATE_LOG 1      // 1=Serial1/Debug Mate 顯示短狀態；USB CDC 仍顯示完整 log
