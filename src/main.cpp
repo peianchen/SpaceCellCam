@@ -49,9 +49,9 @@
 #define CAPTURE_FRAME_SIZE FRAMESIZE_QSXGA
 #define CAPTURE_RESTORE_SETTLE_MS 50 // AF 從 QVGA 切回 QSXGA 後，先讓 sensor/JPEG 穩定
 #define CAPTURE_DISCARD_FRAMES 1     // 正式拍照前丟幾幀；2 較穩但 LED 會多亮約 1~3 秒
-#define LED_PREHEAT_MS    200        // LED 預熱
-#define LED_BRIGHTNESS    60         // LED 亮度（0~255）
-#define STATUS_LED_BRIGHTNESS 80     // 不接Serial時用補光LED顯示狀態
+#define LED_PREHEAT_MS    300        // LED 預熱
+#define LED_BRIGHTNESS    80         // LED 亮度（0~255）
+#define STATUS_LED_BRIGHTNESS 100     // 不接Serial時用補光LED顯示狀態
 #define ENABLE_DEBUG_LOG  1          // 1=印出詳細 debug log；0=只保留必要訊息
 #define ENABLE_DEBUG_MATE_LOG 1      // 1=Serial1/Debug Mate 顯示短狀態；USB CDC 仍顯示完整 log
 #define ENABLE_CAMERA_LIFECYCLE_DEBUG 1 // 1=記錄 fb_get/return、記憶體、溫度、standby 狀態
@@ -75,10 +75,14 @@
 #define AF_REFOCUS_EVERY_N 0         // 0=成功後不週期重對焦；>0=每 N 張重對焦一次
 #define AF_POLL_MS        25         // AF 狀態輪詢間隔
 #define AF_STABLE_COUNT   1          // 連續幾次 focused 才視為已對焦
-#define AF_CENTER_X       30         // OV5640 AF grid: 0~79
+/*#define AF_CENTER_X       30         // OV5640 AF grid: 0~79
 #define AF_CENTER_Y       22         // OV5640 AF grid: 0~59
 #define AF_CENTER_W       20
-#define AF_CENTER_H       16
+#define AF_CENTER_H       168*/
+#define AF_CENTER_X 34
+#define AF_CENTER_Y 24
+#define AF_CENTER_W 12
+#define AF_CENTER_H 10
 #define AWB_WARMUP_FRAMES 8          // 開機時在LED光源下讓AWB收斂的幀數
 #define WB_MODE           0          // 0=Auto  1=Sunny  2=Cloudy  3=Office  4=Home
 #define ENABLE_AWB_LOCK   0          // 0=持續自動白平衡；1=warmup後鎖定
