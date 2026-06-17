@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SpaceCellCam Flowcharts</title>
+  <style>
+    body {
+      margin: 0;
+      background: #f4f7f8;
+      color: #182426;
+      font-family: "Segoe UI", "Noto Sans TC", Arial, sans-serif;
+      line-height: 1.5;
+    }
+
+    main {
+      width: min(1120px, calc(100% - 32px));
+      margin: 28px auto 40px;
+    }
+
+    h1 {
+      margin: 0 0 8px;
+      font-size: 2rem;
+      letter-spacing: 0;
+    }
+
+    p {
+      margin: 0 0 20px;
+      color: #5a686d;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+    }
+
+    section {
+      background: #fff;
+      border: 1px solid #d8e1e4;
+      border-radius: 8px;
+      padding: 16px;
+      box-shadow: 0 8px 24px rgba(22, 36, 39, .06);
+    }
+
+    h2 {
+      margin: 0 0 12px;
+      font-size: 1.15rem;
+      letter-spacing: 0;
+    }
+
+    .mermaid {
+      overflow: auto;
+    }
+
+    .note {
+      margin-top: 14px;
+      padding: 12px;
+      background: #eef6f5;
+      border: 1px solid #cfe2df;
+      border-radius: 8px;
+      color: #234245;
+      font-size: .95rem;
+    }
+
+    @media (max-width: 900px) {
+      .grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media print {
+      body {
+        background: #fff;
+      }
+
+      main {
+        width: 100%;
+        margin: 0;
+      }
+
+      section {
+        break-inside: avoid;
+        box-shadow: none;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>SpaceCellCam 流程圖</h1>
+    <p>比較 OV5640 啟用 standby 與 sensor 維持啟用兩種拍照流程。</p>
+
+    <div class="grid">
+      <section>
+        <h2>版本 A：啟用 Sensor Standby</h2>
+        <div class="mermaid">
+flowchart TD
+  A[拍照週期開始] --> B[Wake OV5640 from Software Standby<br/>REG 0x3008 = 0x02]
+  B --> C[開啟 LED]
+  C --> D[曝光 / AF 穩定]
+  D --> E[丟棄暫存影格]
+  E --> F[擷取正式影格]
+  F --> G[關閉 LED]
+  G --> H[複製 JPEG 到 PSRAM]
+  H --> I[歸還 camera framebuffer]
+  I --> J[Set OV5640 to Software Standby<br/>REG 0x3008 = 0x42]
+  J --> K[寫入 JPEG 到 SD]
+  K --> L[等待下一個排程週期]
+        </div>
+        <div class="note">重點：SD 寫入前就讓 sensor standby，降低 sensor 工作時間、發熱與暗電流風險。</div>
+      </section>
+
+      <section>
+        <h2>版本 B：Sensor 維持啟用</h2>
+        <div class="mermaid">
+flowchart TD
+  A[拍照週期開始] --> B[開啟 LED]
+  B --> C[曝光 / AF 穩定]
+  C --> D[丟棄暫存影格]
+  D --> E[擷取正式影格]
+  E --> F[關閉 LED]
+  F --> G[寫入 JPEG 到 SD]
+  G --> H[等待下一個排程週期]
+        </div>
+        <div class="note">重點：流程較單純，較可能保留 VCM / focus 狀態，但發熱、暗電流與耗電風險較高。</div>
+      </section>
+    </div>
+  </main>
+
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: "default",
+      flowchart: {
+        curve: "basis",
+        nodeSpacing: 38,
+        rankSpacing: 44
+      }
+    });
+  </script>
+</body>
+</html>

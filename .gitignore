@@ -4,3 +4,11 @@
 .vscode/launch.json
 .vscode/ipch
 .clude/
+__pycache__/
+*.py[cod]
+plasmodium/results_*/
+plasmodium/results_plasmodium*/
+plasmodium/param_sweep_*/
+plasmodium/param_sweep_output*/
+plasmodium/segment_tests_*/
+plasmodium/segment_tests_output*/
