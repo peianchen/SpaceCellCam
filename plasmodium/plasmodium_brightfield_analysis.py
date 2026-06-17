@@ -56,6 +56,9 @@ Definitions:
 """
 
 from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor
+import os
+import shutil
 import warnings
 
 import cv2
@@ -714,35 +717,57 @@ def apply_vein_confidence(
     area = out["area_px"].astype(float).replace(0, np.nan)
     vein_area = out["vein_area_px"].astype(float)
     vein_length = out["vein_length_px"].astype(float)
-    area_fraction = vein_area / area
-    length_norm = vein_length / np.sqrt(area)
-    rel_change = vein_length.pct_change().abs()
-    stable_change = rel_change.rolling(
-        int(stable_window), min_periods=1
-    ).median()
+    valid_vein = vein_length.notna() & vein_area.notna()
 
-    base_ok = (
-        (out["frame"].astype(int) >= int(warmup_frames))
-        & (vein_area >= float(min_vein_area_px))
-        & (vein_length >= float(min_vein_length_px))
-        & (length_norm >= float(min_length_norm))
-        & (area_fraction <= float(max_area_fraction))
-        & ((stable_change <= float(max_rel_change)) | stable_change.isna())
-    )
+    area_fraction = pd.Series(np.nan, index=out.index, dtype=float)
+    length_norm = pd.Series(np.nan, index=out.index, dtype=float)
+    rel_change = pd.Series(np.nan, index=out.index, dtype=float)
+    stable_change = pd.Series(np.nan, index=out.index, dtype=float)
+    trusted = pd.Series(False, index=out.index, dtype=bool)
 
-    run_lengths = []
-    run = 0
-    for ok in base_ok.fillna(False).to_numpy(dtype=bool):
-        run = run + 1 if ok else 0
-        run_lengths.append(run)
-    trusted = base_ok & (pd.Series(run_lengths, index=out.index) >= int(require_consecutive))
+    if valid_vein.any():
+        valid_index = out.index[valid_vein]
+        valid_area = area.loc[valid_index]
+        valid_vein_area = vein_area.loc[valid_index]
+        valid_vein_length = vein_length.loc[valid_index]
+
+        valid_area_fraction = valid_vein_area / valid_area
+        valid_length_norm = valid_vein_length / np.sqrt(valid_area)
+        valid_rel_change = valid_vein_length.pct_change(fill_method=None).abs()
+        valid_stable_change = valid_rel_change.rolling(
+            int(stable_window), min_periods=1
+        ).median()
+
+        base_ok_valid = (
+            (out.loc[valid_index, "frame"].astype(int) >= int(warmup_frames))
+            & (valid_vein_area >= float(min_vein_area_px))
+            & (valid_vein_length >= float(min_vein_length_px))
+            & (valid_length_norm >= float(min_length_norm))
+            & (valid_area_fraction <= float(max_area_fraction))
+            & ((valid_stable_change <= float(max_rel_change)) | valid_stable_change.isna())
+        )
+
+        run_lengths = []
+        run = 0
+        for ok in base_ok_valid.fillna(False).to_numpy(dtype=bool):
+            run = run + 1 if ok else 0
+            run_lengths.append(run)
+        trusted_valid = base_ok_valid & (
+            pd.Series(run_lengths, index=valid_index) >= int(require_consecutive)
+        )
+
+        area_fraction.loc[valid_index] = valid_area_fraction
+        length_norm.loc[valid_index] = valid_length_norm
+        rel_change.loc[valid_index] = valid_rel_change
+        stable_change.loc[valid_index] = valid_stable_change
+        trusted.loc[valid_index] = trusted_valid.astype(bool)
 
     out["vein_area_fraction"] = area_fraction
     out["vein_length_norm"] = length_norm
     out["vein_rel_change"] = rel_change
     out["vein_stable_rel_change"] = stable_change
     out["vein_trusted"] = trusted.astype(bool)
-    out["vein_low_confidence"] = ~out["vein_trusted"]
+    out["vein_low_confidence"] = valid_vein & ~out["vein_trusted"]
 
     for col in ["vein_area_px", "vein_length_px", "vein_length", "vein_endpoints", "vein_branchpoints"]:
         trusted_col = f"{col}_trusted"
@@ -866,6 +891,7 @@ def segment_hsv_circle(
     min_hole_size=0,
     morph_open_size=1,
     morph_close_size=0,
+    keep_largest=True,
 ):
     """
     Segment yellow plasmodium using one consistent HSV rule inside a dish circle.
@@ -899,6 +925,9 @@ def segment_hsv_circle(
 
     if min_hole_size and min_hole_size > 0:
         mask = morphology.remove_small_holes(mask.astype(bool), area_threshold=int(min_hole_size))
+
+    if keep_largest:
+        mask = keep_largest_component(mask)
 
     debug = {
         "gray": _as_gray_uint8(frame),
@@ -1060,6 +1089,171 @@ def overlay_mask_skeleton(
     return np.clip(overlay, 0, 255).astype(np.uint8)
 
 
+def _analyze_single_frame_for_parallel(args):
+    """
+    Analyze one frame without using previous-frame state.
+
+    Dynamic expansion/retraction metrics are added later in frame order.
+    """
+    (
+        i,
+        frame,
+        name,
+        dt,
+        pixel_size,
+        roi,
+        analysis_roi,
+        segmentation_profile,
+        dish_center,
+        dish_radius,
+        hsv_params,
+        vein_params,
+        vein_every_n_frames,
+        compute_body_skeleton,
+        preprocess_params,
+        segment_params,
+        keep_debug,
+    ) = args
+
+    gray = _as_gray_uint8(frame)
+    focus = focus_score_laplacian(gray)
+
+    if segmentation_profile == "hsv_circle":
+        enhanced, mask, pre_debug = segment_hsv_circle(
+            frame,
+            dish_center=dish_center,
+            dish_radius=dish_radius,
+            **hsv_params,
+        )
+    elif segmentation_profile in {"classic", "grabcut_blob"}:
+        enhanced, mask, pre_debug = preprocess_and_segment_frame(
+            gray,
+            preprocess_params=preprocess_params,
+            segment_params=segment_params,
+            analysis_roi=analysis_roi,
+        )
+    else:
+        raise ValueError(
+            "segmentation_profile must be 'classic', 'grabcut_blob', or 'hsv_circle'."
+        )
+
+    reg = region_metrics(mask, pixel_size=pixel_size)
+    skel = (
+        skeleton_metrics(mask, pixel_size=pixel_size)
+        if compute_body_skeleton
+        else empty_skeleton_metrics_like(mask)
+    )
+    compute_vein = (
+        segmentation_profile == "hsv_circle"
+        and vein_every_n_frames > 0
+        and i % vein_every_n_frames == 0
+    )
+    vein = vein_network_metrics(
+        frame,
+        dish_center=dish_center,
+        dish_radius=dish_radius,
+        body_mask=mask,
+        pixel_size=pixel_size,
+        **vein_params,
+    ) if compute_vein else None
+
+    row = {
+        "frame": i,
+        "name": name,
+        "time": float(i * dt) if dt is not None else np.nan,
+        "focus_score": focus,
+        **reg,
+        "n_endpoints": skel["n_endpoints"],
+        "n_branchpoints": skel["n_branchpoints"],
+        "skeleton_length_px": skel["skeleton_length_px"],
+        "skeleton_length": skel["skeleton_length"],
+    }
+
+    if vein is not None:
+        row.update(
+            {
+                "vein_area_px": vein["vein_area_px"],
+                "vein_length_px": vein["vein_length_px"],
+                "vein_length": vein["vein_length"],
+                "vein_endpoints": vein["vein_endpoints"],
+                "vein_branchpoints": vein["vein_branchpoints"],
+            }
+        )
+
+    if roi is not None:
+        row["roi_mean_intensity"] = roi_mean_intensity(gray, roi)
+
+    debug_item = None
+    if keep_debug:
+        debug_item = {
+            "frame": i,
+            "name": name,
+            "gray": gray,
+            "background": pre_debug["background"],
+            "corrected": pre_debug["corrected"],
+            "enhanced": enhanced,
+            "mask": mask,
+            "skeleton": skel["skeleton"],
+            "endpoint_mask": skel["endpoint_mask"],
+            "branch_mask": skel["branch_mask"],
+            "vein_mask": vein["vein_mask"] if vein is not None else None,
+            "vein_skeleton": vein["vein_skeleton"] if vein is not None else None,
+        }
+
+    return i, row, debug_item, mask, reg["area"]
+
+
+def _finish_rows_with_temporal_metrics(
+    frame_results,
+    dt,
+    pixel_size,
+    compute_front_speed,
+):
+    """Add previous-frame metrics to already ordered per-frame results."""
+    rows = []
+    debug_data = []
+    prev_mask = None
+    prev_area = np.nan
+
+    for i, row, debug_item, mask, area in frame_results:
+        dyn = expansion_retraction_metrics(
+            prev_mask,
+            mask,
+            dt=dt,
+            pixel_size=pixel_size,
+            compute_front_speed=compute_front_speed,
+        )
+
+        if i == 0 or not np.isfinite(prev_area) or dt is None or dt <= 0:
+            dA_dt = np.nan
+        else:
+            dA_dt = float((area - prev_area) / dt)
+
+        row.update(
+            {
+                "dA_dt": dA_dt,
+                "new_area_px": dyn["new_area_px"],
+                "retracted_area_px": dyn["retracted_area_px"],
+                "explore_ratio": dyn["explore_ratio"],
+                "retreat_ratio": dyn["retreat_ratio"],
+                "net_growth_px": dyn["net_growth_px"],
+                "front_speed_mean": dyn["front_speed_mean"],
+                "front_speed_p95": dyn["front_speed_p95"],
+            }
+        )
+        rows.append(row)
+
+        if debug_item is not None:
+            debug_item["new_region"] = dyn["new_region"]
+            debug_item["retracted_region"] = dyn["retracted_region"]
+            debug_data.append(debug_item)
+
+        prev_mask = mask
+        prev_area = area
+
+    return rows, debug_data
+
+
 def analyze_timelapse(
     frames,
     names=None,
@@ -1078,6 +1272,7 @@ def analyze_timelapse(
     preprocess_params=None,
     segment_params=None,
     keep_debug=True,
+    n_jobs=1,
 ):
     """
     Main time-lapse analysis function.
@@ -1098,6 +1293,57 @@ def analyze_timelapse(
     hsv_params = hsv_params or {}
     vein_params = vein_params or {}
     vein_every_n_frames = int(vein_every_n_frames or 0)
+    n_jobs = int(n_jobs or 1)
+
+    if n_jobs > 1:
+        work_items = [
+            (
+                i,
+                frame,
+                names[i] if i < len(names) else f"frame_{i:06d}",
+                dt,
+                pixel_size,
+                roi,
+                analysis_roi,
+                segmentation_profile,
+                dish_center,
+                dish_radius,
+                hsv_params,
+                vein_params,
+                vein_every_n_frames,
+                compute_body_skeleton,
+                preprocess_params,
+                segment_params,
+                keep_debug,
+            )
+            for i, frame in enumerate(frames)
+        ]
+
+        with ProcessPoolExecutor(max_workers=n_jobs) as executor:
+            frame_results = list(
+                tqdm(
+                    executor.map(_analyze_single_frame_for_parallel, work_items),
+                    total=len(work_items),
+                    desc=f"Analyzing frames with {n_jobs} CPU workers",
+                )
+            )
+
+        frame_results.sort(key=lambda item: item[0])
+        rows, debug_data = _finish_rows_with_temporal_metrics(
+            frame_results,
+            dt=dt,
+            pixel_size=pixel_size,
+            compute_front_speed=compute_front_speed,
+        )
+
+        df = pd.DataFrame(rows)
+        df = apply_vein_confidence(df)
+        if roi is not None and "roi_mean_intensity" in df.columns:
+            osc = analyze_oscillation(df["roi_mean_intensity"].to_numpy(), dt)
+        else:
+            osc = {"dominant_freq": np.nan, "period": np.nan, "n_peaks": 0}
+
+        return df, debug_data, osc
 
     rows = []
     debug_data = []
@@ -1531,27 +1777,79 @@ def plot_summary(df, out_prefix=None):
             out_path = out_path.with_suffix(".png")
         fig.savefig(out_path, dpi=200)
 
-        vein_length_col = "vein_length_trusted" if "vein_length_trusted" in df.columns else "vein_length"
-        vein_endpoints_col = (
-            "vein_endpoints_trusted" if "vein_endpoints_trusted" in df.columns else "vein_endpoints"
+        raw_vein_cols = {"vein_length", "vein_endpoints", "vein_branchpoints"}
+        trusted_vein_cols = {
+            "vein_length_trusted",
+            "vein_endpoints_trusted",
+            "vein_branchpoints_trusted",
+        }
+        has_raw_vein = raw_vein_cols.issubset(df.columns) and df["vein_length"].notna().any()
+        has_trusted_vein = (
+            trusted_vein_cols.issubset(df.columns)
+            and df["vein_length_trusted"].notna().any()
         )
-        vein_branchpoints_col = (
-            "vein_branchpoints_trusted"
-            if "vein_branchpoints_trusted" in df.columns
-            else "vein_branchpoints"
-        )
-        required_vein_cols = {vein_length_col, vein_endpoints_col, vein_branchpoints_col}
-        if required_vein_cols.issubset(df.columns):
+        if has_raw_vein or has_trusted_vein:
             vein_fig, vein_axes = plt.subplots(2, 1, figsize=(12, 7), constrained_layout=True)
-            if "vein_length" in df.columns and vein_length_col != "vein_length":
-                vein_axes[0].plot(t, df["vein_length"], color="0.75", label="raw visible vein length")
-            vein_axes[0].plot(t, df[vein_length_col], color="tab:blue", label="trusted visible vein length")
-            vein_axes[0].set_title("Trusted visible vein network")
+            if has_raw_vein:
+                vein_axes[0].plot(
+                    t,
+                    df["vein_length"],
+                    color="0.65",
+                    marker="o",
+                    linestyle="-",
+                    markersize=3,
+                    label="raw visible vein length",
+                )
+                vein_axes[1].plot(
+                    t,
+                    df["vein_endpoints"],
+                    color="gold",
+                    marker="o",
+                    linestyle="none",
+                    markersize=3,
+                    label="raw vein endpoints",
+                )
+                vein_axes[1].plot(
+                    t,
+                    df["vein_branchpoints"],
+                    color="teal",
+                    marker="o",
+                    linestyle="none",
+                    markersize=3,
+                    label="raw vein branchpoints",
+                )
+            if has_trusted_vein:
+                vein_axes[0].plot(
+                    t,
+                    df["vein_length_trusted"],
+                    color="tab:blue",
+                    marker="o",
+                    linestyle="-",
+                    markersize=3,
+                    label="trusted visible vein length",
+                )
+                vein_axes[1].plot(
+                    t,
+                    df["vein_endpoints_trusted"],
+                    color="orange",
+                    marker="o",
+                    linestyle="-",
+                    markersize=3,
+                    label="trusted vein endpoints",
+                )
+                vein_axes[1].plot(
+                    t,
+                    df["vein_branchpoints_trusted"],
+                    color="tab:green",
+                    marker="o",
+                    linestyle="-",
+                    markersize=3,
+                    label="trusted vein branchpoints",
+                )
+            vein_axes[0].set_title("Visible vein network")
             vein_axes[0].set_xlabel("Time")
             vein_axes[0].set_ylabel("Length")
             vein_axes[0].legend()
-            vein_axes[1].plot(t, df[vein_endpoints_col], color="gold", label="trusted vein endpoints")
-            vein_axes[1].plot(t, df[vein_branchpoints_col], color="teal", label="trusted vein branchpoints")
             vein_axes[1].set_xlabel("Time")
             vein_axes[1].set_ylabel("Count")
             vein_axes[1].legend()
@@ -1608,6 +1906,25 @@ def save_debug_examples(debug_data, out_dir, frame_indices):
             cv2.imwrite(str(out_dir / f"{stem}_corrected.png"), _as_gray_uint8(item["corrected"]))
         cv2.imwrite(str(out_dir / f"{stem}_mask.png"), mask_u8)
         cv2.imwrite(str(out_dir / f"{stem}_overlay.png"), overlay_bgr)
+
+
+def clean_debug_outputs(out_dir, clean_segment_tests=False):
+    """
+    Remove stale debug-only output folders from a previous run.
+
+    This intentionally does not remove the main output directory, metrics CSV,
+    summary CSV, summary plots, or overlay video.
+    """
+    out_dir = Path(out_dir)
+    folders = ["debug_examples", "qc_review"]
+    if clean_segment_tests:
+        folders.append("segment_tests")
+
+    for folder in folders:
+        path = out_dir / folder
+        if path.exists():
+            shutil.rmtree(path)
+        path.mkdir(parents=True, exist_ok=True)
 
 
 def save_overlay_video(debug_data, out_path, fps=10, draw_frame_text=True):
@@ -1855,7 +2172,10 @@ def summarize_run(df, label):
         raise ValueError("df is empty; cannot summarize run.")
 
     def mean_col(col):
-        return float(np.nanmean(df[col])) if col in df.columns else np.nan
+        if col not in df.columns:
+            return np.nan
+        vals = df[col].to_numpy(dtype=float)
+        return float(np.nanmean(vals)) if np.isfinite(vals).any() else np.nan
 
     def final_col(col):
         if col not in df.columns:
@@ -2131,6 +2451,9 @@ if __name__ == "__main__":
     INPUT_PATH = r"C:\Users\chen8\Pictures\研究\實驗圖\年菌\output2.mp4"
     OUTPUT_DIR = r"results_plasmodium"
     OVERLAY_VALIDATION_MODE = True
+    CLEAN_OUTPUT_DEBUG = True
+    ENABLE_CPU_PARALLEL = True
+    CPU_WORKERS = 6
 
     # Use the real acquisition interval, not the exported video playback FPS.
     # Example: images captured every 10 s and exported as 60 FPS video still use 10.0 here.
@@ -2171,6 +2494,9 @@ if __name__ == "__main__":
     print(f"  COMPUTE_BODY_SKELETON = {COMPUTE_BODY_SKELETON}")
     print(f"  COMPUTE_FRONT_SPEED = {COMPUTE_FRONT_SPEED}")
     print(f"  RUN_QC_VALIDATION = {RUN_QC_VALIDATION}")
+    print(f"  CLEAN_OUTPUT_DEBUG = {CLEAN_OUTPUT_DEBUG}")
+    print(f"  ENABLE_CPU_PARALLEL = {ENABLE_CPU_PARALLEL}")
+    print(f"  CPU_WORKERS = {CPU_WORKERS}")
 
     hsv_params = dict(
         h_min=16,
@@ -2181,6 +2507,7 @@ if __name__ == "__main__":
         min_hole_size=0,
         morph_open_size=1,
         morph_close_size=0,
+        keep_largest=True,
     )
 
     vein_params = dict(
@@ -2230,6 +2557,8 @@ if __name__ == "__main__":
 
     out_dir = Path(OUTPUT_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
+    if CLEAN_OUTPUT_DEBUG:
+        clean_debug_outputs(out_dir, clean_segment_tests=True)
 
     load_as_gray = SEGMENTATION_PROFILE != "hsv_circle"
     first_frame, total_hint = _load_first_frame_for_preview(
@@ -2273,7 +2602,13 @@ if __name__ == "__main__":
             vein_params=vein_params,
         )
 
-    if INPUT_MODE == "video" and SEGMENTATION_PROFILE == "hsv_circle":
+    use_streaming_video = (
+        INPUT_MODE == "video"
+        and SEGMENTATION_PROFILE == "hsv_circle"
+        and not ENABLE_CPU_PARALLEL
+    )
+
+    if use_streaming_video:
         cap_probe = cv2.VideoCapture(str(input_path))
         total_frames = int(cap_probe.get(cv2.CAP_PROP_FRAME_COUNT))
         cap_probe.release()
@@ -2337,7 +2672,17 @@ if __name__ == "__main__":
             preprocess_params=preprocess_params,
             segment_params=segment_params,
             keep_debug=True,
+            n_jobs=CPU_WORKERS if ENABLE_CPU_PARALLEL else 1,
         )
+
+        if INPUT_MODE == "video" and SAVE_OVERLAY_VIDEO:
+            overlay_video = out_dir / "plasmodium_overlay.mp4"
+            save_overlay_video(
+                debug_data,
+                overlay_video,
+                fps=OVERLAY_VIDEO_FPS,
+            )
+            print(f"Saved overlay video: {overlay_video}")
 
     metrics_csv = out_dir / "plasmodium_metrics.csv"
     df.to_csv(metrics_csv, index=False, encoding="utf-8-sig")
@@ -2350,7 +2695,13 @@ if __name__ == "__main__":
 
     debug_out = out_dir / "debug_examples"
     if len(debug_data) > 0:
-        save_debug_examples(debug_data, debug_out, list(range(len(debug_data))))
+        if len(debug_data) <= 5:
+            debug_indices_to_save = list(range(len(debug_data)))
+        else:
+            debug_indices_to_save = sorted(
+                set([0, len(debug_data) // 4, len(debug_data) // 2, 3 * len(debug_data) // 4, len(debug_data) - 1])
+            )
+        save_debug_examples(debug_data, debug_out, debug_indices_to_save)
     print(f"Saved debug examples: {debug_out}")
 
     if RUN_QC_VALIDATION:
