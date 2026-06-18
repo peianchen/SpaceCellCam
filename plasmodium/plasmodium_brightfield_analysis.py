@@ -57,6 +57,7 @@ Definitions:
 
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor
+import gc
 import os
 import shutil
 import warnings
@@ -868,6 +869,29 @@ def _roi_slices(shape, roi):
     return slice(y0, y1), slice(x0, x1)
 
 
+def mask_qc_metrics(mask, analysis_roi=None):
+    """Compute per-frame mask coverage and ROI-border contact."""
+    mask = mask.astype(bool)
+    ys, xs = _roi_slices(mask.shape, analysis_roi)
+    roi_mask = mask[ys, xs]
+
+    roi_area = roi_mask.size
+    fraction = float(np.sum(roi_mask) / roi_area) if roi_area > 0 else np.nan
+    touches = False
+    if roi_mask.size > 0 and np.any(roi_mask):
+        touches = bool(
+            np.any(roi_mask[0, :])
+            or np.any(roi_mask[-1, :])
+            or np.any(roi_mask[:, 0])
+            or np.any(roi_mask[:, -1])
+        )
+
+    return {
+        "mask_area_fraction": fraction,
+        "touch_roi_border": touches,
+    }
+
+
 def circular_roi_mask(shape, center, radius):
     """Create a circular ROI mask for dish-inner analysis."""
     if center is None or radius is None:
@@ -1112,8 +1136,10 @@ def _analyze_single_frame_for_parallel(args):
         compute_body_skeleton,
         preprocess_params,
         segment_params,
-        keep_debug,
+        debug_mode,
     ) = args
+    if isinstance(debug_mode, bool):
+        debug_mode = "full" if debug_mode else "none"
 
     gray = _as_gray_uint8(frame)
     focus = focus_score_laplacian(gray)
@@ -1138,6 +1164,7 @@ def _analyze_single_frame_for_parallel(args):
         )
 
     reg = region_metrics(mask, pixel_size=pixel_size)
+    mask_qc = mask_qc_metrics(mask, analysis_roi=analysis_roi)
     skel = (
         skeleton_metrics(mask, pixel_size=pixel_size)
         if compute_body_skeleton
@@ -1163,6 +1190,7 @@ def _analyze_single_frame_for_parallel(args):
         "time": float(i * dt) if dt is not None else np.nan,
         "focus_score": focus,
         **reg,
+        **mask_qc,
         "n_endpoints": skel["n_endpoints"],
         "n_branchpoints": skel["n_branchpoints"],
         "skeleton_length_px": skel["skeleton_length_px"],
@@ -1184,13 +1212,11 @@ def _analyze_single_frame_for_parallel(args):
         row["roi_mean_intensity"] = roi_mean_intensity(gray, roi)
 
     debug_item = None
-    if keep_debug:
+    if debug_mode != "none":
         debug_item = {
             "frame": i,
             "name": name,
             "gray": gray,
-            "background": pre_debug["background"],
-            "corrected": pre_debug["corrected"],
             "enhanced": enhanced,
             "mask": mask,
             "skeleton": skel["skeleton"],
@@ -1199,6 +1225,9 @@ def _analyze_single_frame_for_parallel(args):
             "vein_mask": vein["vein_mask"] if vein is not None else None,
             "vein_skeleton": vein["vein_skeleton"] if vein is not None else None,
         }
+        if debug_mode == "full":
+            debug_item["background"] = pre_debug["background"]
+            debug_item["corrected"] = pre_debug["corrected"]
 
     return i, row, debug_item, mask, reg["area"]
 
@@ -1374,6 +1403,7 @@ def analyze_timelapse(
             )
 
         reg = region_metrics(mask, pixel_size=pixel_size)
+        mask_qc = mask_qc_metrics(mask, analysis_roi=analysis_roi)
         skel = (
             skeleton_metrics(mask, pixel_size=pixel_size)
             if compute_body_skeleton
@@ -1412,6 +1442,7 @@ def analyze_timelapse(
             "time": float(i * dt) if dt is not None else np.nan,
             "focus_score": focus,
             **reg,
+            **mask_qc,
             "dA_dt": dA_dt,
             "new_area_px": dyn["new_area_px"],
             "retracted_area_px": dyn["retracted_area_px"],
@@ -1569,6 +1600,7 @@ def analyze_video_stream(
                 )
 
             reg = region_metrics(mask, pixel_size=pixel_size)
+            mask_qc = mask_qc_metrics(mask, analysis_roi=analysis_roi)
             skel = (
                 skeleton_metrics(mask, pixel_size=pixel_size)
                 if compute_body_skeleton
@@ -1607,6 +1639,7 @@ def analyze_video_stream(
                 "time": float(idx * dt) if dt is not None else np.nan,
                 "focus_score": focus,
                 **reg,
+                **mask_qc,
                 "dA_dt": dA_dt,
                 "new_area_px": dyn["new_area_px"],
                 "retracted_area_px": dyn["retracted_area_px"],
@@ -1700,6 +1733,227 @@ def analyze_video_stream(
 
     df = pd.DataFrame(rows)
     df = apply_vein_confidence(df)
+    if roi is not None and "roi_mean_intensity" in df.columns:
+        osc = analyze_oscillation(df["roi_mean_intensity"].to_numpy(), dt)
+    else:
+        osc = {"dominant_freq": np.nan, "period": np.nan, "n_peaks": 0}
+
+    return df, debug_data, osc
+
+
+def analyze_video_parallel_batches(
+    video_path,
+    dt=30.0,
+    pixel_size=1.0,
+    roi=None,
+    max_frames=None,
+    debug_frame_indices=None,
+    segmentation_profile="hsv_circle",
+    dish_center=None,
+    dish_radius=None,
+    hsv_params=None,
+    vein_params=None,
+    vein_every_n_frames=1,
+    compute_body_skeleton=True,
+    compute_front_speed=True,
+    preprocess_params=None,
+    segment_params=None,
+    analysis_roi=None,
+    overlay_video_path=None,
+    overlay_video_fps=10,
+    n_jobs=4,
+    batch_frames=24,
+):
+    """
+    Analyze a video in bounded parallel batches.
+
+    Only one batch of source frames and analysis arrays is retained at a time.
+    Temporal metrics and overlay output remain ordered across batch boundaries.
+    """
+    video_path = Path(video_path)
+    if not video_path.exists():
+        raise FileNotFoundError(f"Input video does not exist: {video_path}")
+
+    n_jobs = max(1, int(n_jobs or 1))
+    batch_frames = max(n_jobs, int(batch_frames or n_jobs))
+    debug_frame_indices = set(debug_frame_indices or [])
+    hsv_params = hsv_params or {}
+    vein_params = vein_params or {}
+    preprocess_params = preprocess_params or {}
+    segment_params = segment_params or {}
+    vein_every_n_frames = int(vein_every_n_frames or 0)
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise ValueError(f"Could not open video: {video_path}")
+
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if max_frames is not None:
+        total_to_process = min(total, int(max_frames)) if total > 0 else int(max_frames)
+    else:
+        total_to_process = total
+
+    writer = None
+    if overlay_video_path is not None:
+        overlay_video_path = Path(overlay_video_path)
+        overlay_video_path.parent.mkdir(parents=True, exist_ok=True)
+
+    rows = []
+    debug_data = []
+    prev_mask = None
+    prev_area = np.nan
+    idx = 0
+
+    try:
+        with ProcessPoolExecutor(max_workers=n_jobs) as executor:
+            with tqdm(
+                total=total_to_process if total_to_process > 0 else None,
+                desc=f"Analyzing video in batches with {n_jobs} CPU workers",
+            ) as pbar:
+                while True:
+                    batch = []
+                    while len(batch) < batch_frames:
+                        if max_frames is not None and idx + len(batch) >= int(max_frames):
+                            break
+                        ok, frame_bgr = cap.read()
+                        if not ok:
+                            break
+                        frame_idx = idx + len(batch)
+                        frame_for_analysis = (
+                            frame_bgr
+                            if segmentation_profile == "hsv_circle"
+                            else cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+                        )
+                        batch.append((frame_idx, frame_for_analysis))
+
+                    if not batch:
+                        break
+
+                    work_items = []
+                    for frame_idx, frame in batch:
+                        need_debug = (
+                            overlay_video_path is not None
+                            or frame_idx in debug_frame_indices
+                        )
+                        debug_mode = "overlay" if need_debug else "none"
+                        work_items.append(
+                            (
+                                frame_idx,
+                                frame,
+                                f"frame_{frame_idx:06d}",
+                                dt,
+                                pixel_size,
+                                roi,
+                                analysis_roi,
+                                segmentation_profile,
+                                dish_center,
+                                dish_radius,
+                                hsv_params,
+                                vein_params,
+                                vein_every_n_frames,
+                                compute_body_skeleton,
+                                preprocess_params,
+                                segment_params,
+                                debug_mode,
+                            )
+                        )
+                    frame_results = list(
+                        executor.map(_analyze_single_frame_for_parallel, work_items)
+                    )
+                    frame_results.sort(key=lambda item: item[0])
+
+                    for frame_idx, row, debug_item, mask, area in frame_results:
+                        dyn = expansion_retraction_metrics(
+                            prev_mask,
+                            mask,
+                            dt=dt,
+                            pixel_size=pixel_size,
+                            compute_front_speed=compute_front_speed,
+                        )
+                        if (
+                            frame_idx == 0
+                            or not np.isfinite(prev_area)
+                            or dt is None
+                            or dt <= 0
+                        ):
+                            dA_dt = np.nan
+                        else:
+                            dA_dt = float((area - prev_area) / dt)
+
+                        row.update(
+                            {
+                                "dA_dt": dA_dt,
+                                "new_area_px": dyn["new_area_px"],
+                                "retracted_area_px": dyn["retracted_area_px"],
+                                "explore_ratio": dyn["explore_ratio"],
+                                "retreat_ratio": dyn["retreat_ratio"],
+                                "net_growth_px": dyn["net_growth_px"],
+                                "front_speed_mean": dyn["front_speed_mean"],
+                                "front_speed_p95": dyn["front_speed_p95"],
+                            }
+                        )
+                        rows.append(row)
+
+                        if debug_item is not None:
+                            debug_item["new_region"] = dyn["new_region"]
+                            debug_item["retracted_region"] = dyn["retracted_region"]
+
+                        if overlay_video_path is not None:
+                            if debug_item is None:
+                                raise RuntimeError(
+                                    f"Missing overlay data for frame {frame_idx}."
+                                )
+                            overlay_rgb = overlay_mask_skeleton(
+                                debug_item["gray"],
+                                mask=mask,
+                                skeleton=debug_item["skeleton"],
+                                endpoint_mask=debug_item["endpoint_mask"],
+                                branch_mask=debug_item["branch_mask"],
+                                vein_mask=debug_item["vein_mask"],
+                                vein_skeleton=debug_item["vein_skeleton"],
+                                new_region=dyn["new_region"],
+                                retracted_region=dyn["retracted_region"],
+                            )
+                            overlay_bgr = cv2.cvtColor(overlay_rgb, cv2.COLOR_RGB2BGR)
+                            if writer is None:
+                                height, width = overlay_bgr.shape[:2]
+                                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                                writer = cv2.VideoWriter(
+                                    str(overlay_video_path),
+                                    fourcc,
+                                    float(overlay_video_fps),
+                                    (width, height),
+                                    True,
+                                )
+                                if not writer.isOpened():
+                                    raise ValueError(
+                                        f"Could not open video writer for: {overlay_video_path}"
+                                    )
+                            writer.write(overlay_bgr)
+
+                        if frame_idx in debug_frame_indices and debug_item is not None:
+                            debug_data.append(debug_item)
+
+                        prev_mask = mask
+                        prev_area = area
+
+                    processed = len(batch)
+                    idx += processed
+                    pbar.update(processed)
+                    del batch, work_items, frame_results
+                    gc.collect()
+
+                    if processed < batch_frames:
+                        break
+    finally:
+        cap.release()
+        if writer is not None:
+            writer.release()
+
+    if not rows:
+        raise ValueError(f"No frames could be read from video: {video_path}")
+
+    df = apply_vein_confidence(pd.DataFrame(rows))
     if roi is not None and "roi_mean_intensity" in df.columns:
         osc = analyze_oscillation(df["roi_mean_intensity"].to_numpy(), dt)
     else:
@@ -1858,12 +2112,20 @@ def plot_summary(df, out_prefix=None):
     return fig
 
 
-def save_debug_examples(debug_data, out_dir, frame_indices):
+def save_debug_examples(
+    debug_data,
+    out_dir,
+    frame_indices,
+    use_frame_number=False,
+):
     """
     Save gray, prep, mask, and overlay images for selected frames.
 
     Overlay contains mask, skeleton, endpoints, branchpoints, new region,
     and retracted region.
+
+    By default, frame_indices are positions in debug_data. When
+    use_frame_number=True, they are matched against item["frame"] instead.
     """
     if debug_data is None or len(debug_data) == 0:
         warnings.warn("No debug_data available to save.")
@@ -1872,12 +2134,23 @@ def save_debug_examples(debug_data, out_dir, frame_indices):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    for idx in frame_indices:
-        if idx < 0 or idx >= len(debug_data):
-            warnings.warn(f"Debug frame index out of range: {idx}")
-            continue
+    frame_to_item = None
+    if use_frame_number:
+        frame_to_item = {int(item["frame"]): item for item in debug_data}
 
-        item = debug_data[idx]
+    for idx in frame_indices:
+        idx = int(idx)
+        if use_frame_number:
+            item = frame_to_item.get(idx)
+            if item is None:
+                warnings.warn(f"Debug frame number not available: {idx}")
+                continue
+        else:
+            if idx < 0 or idx >= len(debug_data):
+                warnings.warn(f"Debug frame index out of range: {idx}")
+                continue
+
+            item = debug_data[idx]
         stem = f"frame_{int(item['frame']):06d}"
 
         gray = _as_gray_uint8(item["gray"])
@@ -2033,36 +2306,41 @@ def validate_analysis_qc(
         qc["focus_robust_z"] = np.nan
         qc["flag_low_focus"] = False
 
-    qc["mask_area_fraction"] = np.nan
-    qc["flag_area_fraction"] = False
-    qc["flag_touch_roi_border"] = False
+    has_df_mask_fraction = "mask_area_fraction" in df.columns
+    has_df_touch_border = "touch_roi_border" in df.columns
+    qc["mask_area_fraction"] = (
+        pd.to_numeric(df["mask_area_fraction"], errors="coerce")
+        if has_df_mask_fraction
+        else np.nan
+    )
+    qc["touch_roi_border"] = (
+        df["touch_roi_border"].astype("boolean")
+        if has_df_touch_border
+        else pd.Series(pd.NA, index=df.index, dtype="boolean")
+    )
 
-    if debug_data:
+    if debug_data and (not has_df_mask_fraction or not has_df_touch_border):
         for item in debug_data:
             idx = int(item["frame"])
-            mask = item["mask"].astype(bool)
-            if analysis_roi is None:
-                roi_mask = mask
-            else:
-                ys, xs = _roi_slices(mask.shape, analysis_roi)
-                roi_mask = mask[ys, xs]
+            fallback_qc = mask_qc_metrics(item["mask"], analysis_roi=analysis_roi)
+            frame_match = qc["frame"] == idx
+            if not has_df_mask_fraction:
+                qc.loc[frame_match, "mask_area_fraction"] = fallback_qc[
+                    "mask_area_fraction"
+                ]
+            if not has_df_touch_border:
+                qc.loc[frame_match, "touch_roi_border"] = fallback_qc[
+                    "touch_roi_border"
+                ]
 
-            roi_area = roi_mask.size
-            fraction = float(np.sum(roi_mask) / roi_area) if roi_area > 0 else np.nan
-            qc.loc[qc["frame"] == idx, "mask_area_fraction"] = fraction
-            lo, hi = mask_area_fraction_limits
-            qc.loc[qc["frame"] == idx, "flag_area_fraction"] = bool(
-                np.isfinite(fraction) and (fraction < lo or fraction > hi)
-            )
-
-            if roi_mask.size > 0 and np.any(roi_mask):
-                touches = (
-                    np.any(roi_mask[0, :])
-                    or np.any(roi_mask[-1, :])
-                    or np.any(roi_mask[:, 0])
-                    or np.any(roi_mask[:, -1])
-                )
-                qc.loc[qc["frame"] == idx, "flag_touch_roi_border"] = bool(touches)
+    lo, hi = mask_area_fraction_limits
+    fraction = pd.to_numeric(qc["mask_area_fraction"], errors="coerce")
+    qc["flag_area_fraction"] = fraction.notna() & (
+        (fraction < float(lo)) | (fraction > float(hi))
+    )
+    qc["flag_touch_roi_border"] = (
+        qc["touch_roi_border"].fillna(False).astype(bool)
+    )
 
     flag_cols = [
         "flag_empty_or_tiny",
@@ -2080,9 +2358,20 @@ def validate_analysis_qc(
         review_dir = out_dir / "qc_review"
         review_dir.mkdir(parents=True, exist_ok=True)
         flagged = qc.loc[qc["needs_review"], "frame"].astype(int).tolist()
-        sampled = sorted(set(np.linspace(0, len(debug_data) - 1, min(12, len(debug_data)), dtype=int).tolist()))
-        review_indices = sorted(set(flagged[:40] + sampled))
-        save_debug_examples(debug_data, review_dir, review_indices)
+        sampled_indices = np.linspace(
+            0,
+            len(debug_data) - 1,
+            min(12, len(debug_data)),
+            dtype=int,
+        ).tolist()
+        sampled_frames = [int(debug_data[idx]["frame"]) for idx in sampled_indices]
+        review_frame_numbers = sorted(set(flagged[:40] + sampled_frames))
+        save_debug_examples(
+            debug_data,
+            review_dir,
+            review_frame_numbers,
+            use_frame_number=True,
+        )
 
     print(f"Saved QC flags CSV: {qc_csv}")
     print(f"QC frames needing review: {int(qc['needs_review'].sum())} / {len(qc)}")
@@ -2453,7 +2742,9 @@ if __name__ == "__main__":
     OVERLAY_VALIDATION_MODE = True
     CLEAN_OUTPUT_DEBUG = True
     ENABLE_CPU_PARALLEL = True
-    CPU_WORKERS = 6
+    CPU_WORKERS = 8
+    LOW_MEMORY_VIDEO_STREAM = True
+    PARALLEL_BATCH_FRAMES = 32
 
     # Use the real acquisition interval, not the exported video playback FPS.
     # Example: images captured every 10 s and exported as 60 FPS video still use 10.0 here.
@@ -2497,6 +2788,8 @@ if __name__ == "__main__":
     print(f"  CLEAN_OUTPUT_DEBUG = {CLEAN_OUTPUT_DEBUG}")
     print(f"  ENABLE_CPU_PARALLEL = {ENABLE_CPU_PARALLEL}")
     print(f"  CPU_WORKERS = {CPU_WORKERS}")
+    print(f"  LOW_MEMORY_VIDEO_STREAM = {LOW_MEMORY_VIDEO_STREAM}")
+    print(f"  PARALLEL_BATCH_FRAMES = {PARALLEL_BATCH_FRAMES}")
 
     hsv_params = dict(
         h_min=16,
@@ -2605,10 +2898,15 @@ if __name__ == "__main__":
     use_streaming_video = (
         INPUT_MODE == "video"
         and SEGMENTATION_PROFILE == "hsv_circle"
-        and not ENABLE_CPU_PARALLEL
+        and (LOW_MEMORY_VIDEO_STREAM or not ENABLE_CPU_PARALLEL)
     )
 
     if use_streaming_video:
+        if ENABLE_CPU_PARALLEL and LOW_MEMORY_VIDEO_STREAM:
+            print(
+                "Low-memory batched video analysis is enabled; CPU workers will "
+                "process a bounded number of frames at a time."
+            )
         cap_probe = cv2.VideoCapture(str(input_path))
         total_frames = int(cap_probe.get(cv2.CAP_PROP_FRAME_COUNT))
         cap_probe.release()
@@ -2622,8 +2920,7 @@ if __name__ == "__main__":
             )
 
         overlay_video = out_dir / "plasmodium_overlay.mp4" if SAVE_OVERLAY_VIDEO else None
-        df, debug_data, osc = analyze_video_stream(
-            input_path,
+        video_analysis_kwargs = dict(
             dt=FRAME_INTERVAL,
             pixel_size=PIXEL_SIZE,
             roi=ROI,
@@ -2640,6 +2937,18 @@ if __name__ == "__main__":
             overlay_video_path=overlay_video,
             overlay_video_fps=OVERLAY_VIDEO_FPS,
         )
+        if ENABLE_CPU_PARALLEL and LOW_MEMORY_VIDEO_STREAM:
+            df, debug_data, osc = analyze_video_parallel_batches(
+                input_path,
+                **video_analysis_kwargs,
+                n_jobs=CPU_WORKERS,
+                batch_frames=PARALLEL_BATCH_FRAMES,
+            )
+        else:
+            df, debug_data, osc = analyze_video_stream(
+                input_path,
+                **video_analysis_kwargs,
+            )
         print(f"Analyzed {len(df)} frames.")
     else:
         if INPUT_MODE == "folder":
@@ -2674,6 +2983,8 @@ if __name__ == "__main__":
             keep_debug=True,
             n_jobs=CPU_WORKERS if ENABLE_CPU_PARALLEL else 1,
         )
+        del frames, names
+        gc.collect()
 
         if INPUT_MODE == "video" and SAVE_OVERLAY_VIDEO:
             overlay_video = out_dir / "plasmodium_overlay.mp4"
@@ -2691,6 +3002,8 @@ if __name__ == "__main__":
     summary_plot = out_dir / "plasmodium_summary.png"
     plot_summary(df, out_prefix=summary_plot)
     plt.show()
+    plt.close("all")
+    gc.collect()
     print(f"Saved summary plot: {summary_plot}")
 
     debug_out = out_dir / "debug_examples"
