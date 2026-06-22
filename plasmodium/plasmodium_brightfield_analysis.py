@@ -2453,6 +2453,557 @@ def validate_against_manual_masks(debug_data, manual_mask_dir, out_csv):
     return result
 
 
+def _reliability_level(value, high_limit, medium_limit):
+    """Classify a non-negative sensitivity value; lower is better."""
+    if not np.isfinite(value):
+        return "not_available"
+    if value <= float(high_limit):
+        return "high"
+    if value <= float(medium_limit):
+        return "medium"
+    return "low"
+
+
+def validate_segmentation_reliability(
+    video_path,
+    metrics_df,
+    out_dir,
+    dish_center,
+    dish_radius,
+    hsv_params,
+    vein_params=None,
+    pixel_size=1.0,
+    sample_count=5,
+    top_area_jump_count=8,
+    section_frames=None,
+    samples_per_section=6,
+    top_jumps_per_section=4,
+    validate_veins=True,
+    vein_sample_count=3,
+):
+    """
+    Estimate internal segmentation reliability without manual ground truth.
+
+    Representative and high-area-change frames are re-segmented after small
+    HSV perturbations. This is not a true accuracy score; manual masks are
+    still required for ground-truth IoU/Dice.
+    """
+    if metrics_df is None or metrics_df.empty:
+        raise ValueError("metrics_df is empty; cannot validate reliability.")
+
+    video_path = Path(video_path)
+    if not video_path.exists():
+        raise FileNotFoundError(f"Video does not exist: {video_path}")
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    hsv_params = dict(hsv_params or {})
+    vein_params = dict(vein_params or {})
+
+    frame_numbers = metrics_df["frame"].astype(int).to_numpy()
+    area_jump = pd.to_numeric(metrics_df["area_px"], errors="coerce").diff().abs()
+    section_ranges = []
+    if section_frames is not None and int(section_frames) > 0:
+        section_frames = min(int(section_frames), len(frame_numbers))
+        first_frame = int(frame_numbers.min())
+        last_frame = int(frame_numbers.max())
+        middle_start = first_frame + max(0, (len(frame_numbers) - section_frames) // 2)
+        starts = [first_frame, middle_start, last_frame - section_frames + 1]
+        labels = ["front", "middle", "rear"]
+        selected = set()
+        for label, start in zip(labels, starts):
+            end = min(last_frame, start + section_frames - 1)
+            section_ranges.append((label, int(start), int(end)))
+            subset = metrics_df[
+                metrics_df["frame"].astype(int).between(int(start), int(end))
+            ]
+            if subset.empty:
+                continue
+            sampled = np.linspace(
+                int(start), int(end),
+                min(int(samples_per_section), len(subset)), dtype=int,
+            )
+            jump_count = min(int(top_jumps_per_section), max(len(subset) - 1, 0))
+            jump_frames = metrics_df.loc[
+                area_jump.loc[subset.index].nlargest(jump_count).index, "frame"
+            ].astype(int).to_numpy()
+            selected.update(sampled.tolist())
+            selected.update(jump_frames.tolist())
+        selected_frames = sorted(selected)
+    else:
+        evenly_sampled = np.linspace(
+            int(frame_numbers.min()), int(frame_numbers.max()),
+            min(int(sample_count), len(frame_numbers)), dtype=int,
+        )
+        top_count = min(int(top_area_jump_count), max(len(metrics_df) - 1, 0))
+        top_jump_frames = metrics_df.loc[
+            area_jump.nlargest(top_count).index, "frame"
+        ].astype(int).to_numpy()
+        selected_frames = sorted(set(evenly_sampled.tolist() + top_jump_frames.tolist()))
+
+    def section_label(frame_idx):
+        for label, start, end in section_ranges:
+            if start <= int(frame_idx) <= end:
+                return label
+        return "global"
+
+    hsv_variants = [
+        {"h_min": max(0, int(hsv_params.get("h_min", 16)) - 2)},
+        {"h_min": min(179, int(hsv_params.get("h_min", 16)) + 2)},
+        {"h_max": max(0, int(hsv_params.get("h_max", 48)) - 2)},
+        {"h_max": min(179, int(hsv_params.get("h_max", 48)) + 2)},
+        {"s_min": max(0, int(hsv_params.get("s_min", 60)) - 5)},
+        {"s_min": min(255, int(hsv_params.get("s_min", 60)) + 5)},
+        {"v_min": max(0, int(hsv_params.get("v_min", 45)) - 5)},
+        {"v_min": min(255, int(hsv_params.get("v_min", 45)) + 5)},
+    ]
+    metric_names = [
+        "area_px", "perimeter_px", "circularity", "solidity",
+        "skeleton_length_px", "n_branchpoints", "n_endpoints",
+    ]
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise ValueError(f"Could not open video for reliability validation: {video_path}")
+    frame_rows = []
+    try:
+        for frame_idx in tqdm(selected_frames, desc="Validating segmentation reliability"):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
+            ok, frame = cap.read()
+            if not ok:
+                warnings.warn(f"Could not read validation frame {frame_idx}.")
+                continue
+
+            _, base_mask, _ = segment_hsv_circle(
+                frame, dish_center=dish_center, dish_radius=dish_radius, **hsv_params
+            )
+            base_mask = base_mask.astype(bool)
+            base_reg = region_metrics(base_mask, pixel_size=pixel_size)
+            base_skel = skeleton_metrics(base_mask, pixel_size=pixel_size)
+            base_values = {
+                **base_reg,
+                "skeleton_length_px": base_skel["skeleton_length_px"],
+                "n_branchpoints": base_skel["n_branchpoints"],
+                "n_endpoints": base_skel["n_endpoints"],
+            }
+            variant_ious = []
+            relative_changes = {name: [] for name in metric_names}
+            for changes in hsv_variants:
+                params = dict(hsv_params)
+                params.update(changes)
+                _, alt_mask, _ = segment_hsv_circle(
+                    frame, dish_center=dish_center, dish_radius=dish_radius, **params
+                )
+                alt_mask = alt_mask.astype(bool)
+                inter = int(np.sum(base_mask & alt_mask))
+                union = int(np.sum(base_mask | alt_mask))
+                variant_ious.append(float(inter / union) if union > 0 else 1.0)
+                alt_reg = region_metrics(alt_mask, pixel_size=pixel_size)
+                alt_skel = skeleton_metrics(alt_mask, pixel_size=pixel_size)
+                alt_values = {
+                    **alt_reg,
+                    "skeleton_length_px": alt_skel["skeleton_length_px"],
+                    "n_branchpoints": alt_skel["n_branchpoints"],
+                    "n_endpoints": alt_skel["n_endpoints"],
+                }
+                for name in metric_names:
+                    base_value = float(base_values[name])
+                    alt_value = float(alt_values[name])
+                    relative_changes[name].append(
+                        float(abs(alt_value - base_value) / max(abs(base_value), np.finfo(float).eps))
+                    )
+
+            gray = _as_gray_uint8(frame)
+            grad = cv2.magnitude(
+                cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3),
+                cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3),
+            )
+            boundary = cv2.morphologyEx(
+                base_mask.astype(np.uint8), cv2.MORPH_GRADIENT,
+                np.ones((3, 3), dtype=np.uint8),
+            ).astype(bool)
+            ring = (
+                cv2.dilate(base_mask.astype(np.uint8), np.ones((9, 9), dtype=np.uint8)).astype(bool)
+                ^ cv2.erode(base_mask.astype(np.uint8), np.ones((9, 9), dtype=np.uint8)).astype(bool)
+            )
+            boundary_gradient = float(np.mean(grad[boundary])) if np.any(boundary) else np.nan
+            ring_gradient = float(np.mean(grad[ring])) if np.any(ring) else np.nan
+            boundary_support_ratio = (
+                float(boundary_gradient / ring_gradient)
+                if np.isfinite(ring_gradient) and ring_gradient > 0 else np.nan
+            )
+
+            temporal_mask_iou = np.nan
+            temporal_changed_fraction = np.nan
+            temporal_image_support_ratio = np.nan
+            if frame_idx > 0:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx) - 1)
+                prev_ok, prev_frame = cap.read()
+                if prev_ok:
+                    _, prev_mask, _ = segment_hsv_circle(
+                        prev_frame, dish_center=dish_center,
+                        dish_radius=dish_radius, **hsv_params
+                    )
+                    prev_mask = prev_mask.astype(bool)
+                    mask_inter = int(np.sum(prev_mask & base_mask))
+                    mask_union = int(np.sum(prev_mask | base_mask))
+                    temporal_mask_iou = float(mask_inter / mask_union) if mask_union > 0 else 1.0
+                    changed = prev_mask ^ base_mask
+                    temporal_changed_fraction = (
+                        float(np.sum(changed) / mask_union) if mask_union > 0 else 0.0
+                    )
+                    stable = prev_mask & base_mask
+                    edge_band = (
+                        cv2.dilate((prev_mask | base_mask).astype(np.uint8), np.ones((15, 15), dtype=np.uint8)).astype(bool)
+                        ^ cv2.erode(stable.astype(np.uint8), np.ones((15, 15), dtype=np.uint8)).astype(bool)
+                    )
+                    stable_edge = edge_band & (~changed)
+                    frame_difference = cv2.absdiff(
+                        _as_gray_uint8(prev_frame), gray
+                    ).astype(np.float32)
+                    changed_difference = float(np.mean(frame_difference[changed])) if np.any(changed) else np.nan
+                    stable_difference = float(np.mean(frame_difference[stable_edge])) if np.any(stable_edge) else np.nan
+                    if np.isfinite(changed_difference) and np.isfinite(stable_difference) and stable_difference > 0:
+                        temporal_image_support_ratio = float(changed_difference / stable_difference)
+
+            csv_match = metrics_df.loc[metrics_df["frame"] == frame_idx, "area_px"]
+            csv_area_px = float(csv_match.iloc[0]) if not csv_match.empty else np.nan
+            csv_area_relative_error = (
+                float(abs(base_reg["area_px"] - csv_area_px) / max(abs(csv_area_px), 1.0))
+                if np.isfinite(csv_area_px) else np.nan
+            )
+            row = {
+                "frame": int(frame_idx),
+                "section": section_label(frame_idx),
+                "base_area_px": int(base_reg["area_px"]),
+                "csv_area_px": csv_area_px,
+                "csv_area_relative_error": csv_area_relative_error,
+                "min_perturbed_mask_iou": float(np.min(variant_ious)),
+                "median_perturbed_mask_iou": float(np.median(variant_ious)),
+                "boundary_gradient_ratio": boundary_support_ratio,
+                "temporal_mask_iou": temporal_mask_iou,
+                "temporal_changed_fraction": temporal_changed_fraction,
+                "temporal_image_support_ratio": temporal_image_support_ratio,
+            }
+            for name in metric_names:
+                row[f"{name}_max_relative_change"] = float(np.max(relative_changes[name]))
+            row["body_mask_confidence"] = (
+                "high"
+                if row["min_perturbed_mask_iou"] >= 0.98
+                and row["area_px_max_relative_change"] <= 0.03
+                and row["boundary_gradient_ratio"] >= 1.20
+                else "medium"
+                if row["min_perturbed_mask_iou"] >= 0.95
+                and row["area_px_max_relative_change"] <= 0.08
+                and row["boundary_gradient_ratio"] >= 1.00
+                else "low"
+            )
+            frame_rows.append(row)
+    finally:
+        cap.release()
+
+    frame_result = pd.DataFrame(frame_rows)
+    frame_csv = out_dir / "plasmodium_reliability_frames.csv"
+    frame_result.to_csv(frame_csv, index=False, encoding="utf-8-sig")
+
+    sensitivity_rules = {
+        "area_px": (0.03, 0.08),
+        "solidity": (0.03, 0.08),
+        "perimeter_px": (0.08, 0.15),
+        "circularity": (0.10, 0.20),
+        "skeleton_length_px": (0.10, 0.25),
+        "n_branchpoints": (0.15, 0.35),
+        "n_endpoints": (0.15, 0.35),
+    }
+    summary_rows = []
+    mask_min_iou = pd.to_numeric(frame_result["min_perturbed_mask_iou"], errors="coerce")
+    summary_rows.append({
+        "metric": "body_mask",
+        "validation_type": "hsv_parameter_perturbation_iou",
+        "n_tested_frames": int(mask_min_iou.notna().sum()),
+        "median_relative_change": np.nan,
+        "worst_relative_change": float(1.0 - np.nanmin(mask_min_iou)),
+        "confidence": "high" if np.nanmin(mask_min_iou) >= 0.98 else "medium" if np.nanmin(mask_min_iou) >= 0.95 else "low",
+        "interpretation": "internally stable; manual masks still required for true accuracy",
+    })
+    for name, (high_limit, medium_limit) in sensitivity_rules.items():
+        values = pd.to_numeric(frame_result[f"{name}_max_relative_change"], errors="coerce")
+        worst = float(np.nanmax(values)) if np.isfinite(values).any() else np.nan
+        median = float(np.nanmedian(values)) if np.isfinite(values).any() else np.nan
+        summary_rows.append({
+            "metric": name,
+            "validation_type": "hsv_parameter_sensitivity",
+            "n_tested_frames": int(values.notna().sum()),
+            "median_relative_change": median,
+            "worst_relative_change": worst,
+            "confidence": _reliability_level(worst, high_limit, medium_limit),
+            "interpretation": "quantitative trend" if name in {"area_px", "solidity"} else "relative trend",
+        })
+
+    if validate_veins and vein_params and "vein_length_px" in metrics_df.columns:
+        valid_vein_frames = metrics_df.loc[
+            pd.to_numeric(metrics_df["vein_length_px"], errors="coerce").notna(), "frame"
+        ].astype(int)
+        if not valid_vein_frames.empty:
+            vein_frames = np.linspace(
+                int(valid_vein_frames.min()), int(valid_vein_frames.max()),
+                min(int(vein_sample_count), len(valid_vein_frames)), dtype=int,
+            )
+            threshold = float(vein_params.get("ridge_threshold_percentile", 93))
+            response = float(vein_params.get("ridge_min_response", 0.01))
+            erode_size = int(vein_params.get("body_erode_size", 2))
+            vein_variants = [
+                {"ridge_threshold_percentile": max(0.0, threshold - 1.0)},
+                {"ridge_threshold_percentile": min(100.0, threshold + 1.0)},
+                {"ridge_min_response": max(0.0, response * 0.5)},
+                {"ridge_min_response": response * 2.0},
+                {"body_erode_size": max(0, erode_size - 1)},
+                {"body_erode_size": erode_size + 1},
+            ]
+            vein_changes = {
+                "vein_area_px": [], "vein_length_px": [],
+                "vein_endpoints": [], "vein_branchpoints": [],
+            }
+            cap = cv2.VideoCapture(str(video_path))
+            try:
+                for frame_idx in tqdm(vein_frames, desc="Validating vein reliability"):
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
+                    ok, frame = cap.read()
+                    if not ok:
+                        continue
+                    _, body_mask, _ = segment_hsv_circle(
+                        frame, dish_center=dish_center, dish_radius=dish_radius, **hsv_params
+                    )
+                    base_vein = vein_network_metrics(
+                        frame, dish_center=dish_center, dish_radius=dish_radius,
+                        body_mask=body_mask, pixel_size=pixel_size, **vein_params
+                    )
+                    for changes in vein_variants:
+                        params = dict(vein_params)
+                        params.update(changes)
+                        alt_vein = vein_network_metrics(
+                            frame, dish_center=dish_center, dish_radius=dish_radius,
+                            body_mask=body_mask, pixel_size=pixel_size, **params
+                        )
+                        for name in vein_changes:
+                            base_value = float(base_vein[name])
+                            alt_value = float(alt_vein[name])
+                            vein_changes[name].append(
+                                float(abs(alt_value - base_value) / max(abs(base_value), 1.0))
+                            )
+            finally:
+                cap.release()
+
+            vein_rules = {
+                "vein_area_px": (0.15, 0.35),
+                "vein_length_px": (0.15, 0.35),
+                "vein_endpoints": (0.20, 0.40),
+                "vein_branchpoints": (0.20, 0.40),
+            }
+            for name, values in vein_changes.items():
+                values = np.asarray(values, dtype=float)
+                worst = float(np.nanmax(values)) if np.isfinite(values).any() else np.nan
+                median = float(np.nanmedian(values)) if np.isfinite(values).any() else np.nan
+                high_limit, medium_limit = vein_rules[name]
+                summary_rows.append({
+                    "metric": name,
+                    "validation_type": "vein_parameter_sensitivity",
+                    "n_tested_frames": int(len(vein_frames)),
+                    "median_relative_change": median,
+                    "worst_relative_change": worst,
+                    "confidence": _reliability_level(worst, high_limit, medium_limit),
+                    "interpretation": "trend only; not an absolute anatomical measurement",
+                })
+
+    summary_result = pd.DataFrame(summary_rows)
+    summary_csv = out_dir / "plasmodium_reliability_summary.csv"
+    summary_result.to_csv(summary_csv, index=False, encoding="utf-8-sig")
+    print(f"Saved reliability frame CSV: {frame_csv}")
+    print(f"Saved reliability summary CSV: {summary_csv}")
+    if not frame_result.empty:
+        print(
+            "Body-mask reliability: "
+            f"minimum perturbed IoU={frame_result['min_perturbed_mask_iou'].min():.3f}, "
+            f"high-confidence frames={int((frame_result['body_mask_confidence'] == 'high').sum())}/{len(frame_result)}"
+        )
+    return frame_result, summary_result
+
+def save_lightweight_validation_clips(
+    video_path,
+    out_dir,
+    dish_center,
+    dish_radius,
+    hsv_params,
+    section_frames=300,
+    output_scale=0.5,
+    stills_per_section=6,
+    overlay_alpha=0.40,
+):
+    """
+    Save low-resource color overlay clips for the full video's front/middle/rear.
+
+    Only body segmentation is computed. Skeleton, vein, front-speed, and full
+    metric analysis are intentionally skipped to keep CPU and memory use low.
+    """
+    video_path = Path(video_path)
+    if not video_path.exists():
+        raise FileNotFoundError(f"Video does not exist: {video_path}")
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise ValueError(f"Could not open video: {video_path}")
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    source_fps = float(cap.get(cv2.CAP_PROP_FPS))
+    cap.release()
+    if total_frames <= 0:
+        raise ValueError(f"Video frame count is unavailable: {video_path}")
+
+    section_frames = max(1, min(int(section_frames), total_frames))
+    output_scale = float(np.clip(output_scale, 0.1, 1.0))
+    ranges = [
+        ("front", 0),
+        ("middle", max(0, (total_frames - section_frames) // 2)),
+        ("rear", max(0, total_frames - section_frames)),
+    ]
+    validation_dir = Path(out_dir) / "validation_clips"
+    if validation_dir.exists():
+        shutil.rmtree(validation_dir)
+    validation_dir.mkdir(parents=True, exist_ok=True)
+
+    summary_rows = []
+    completed_starts = set()
+    for label, start_frame in ranges:
+        if start_frame in completed_starts:
+            continue
+        completed_starts.add(start_frame)
+        end_frame = min(total_frames - 1, start_frame + section_frames - 1)
+        section_dir = validation_dir / label
+        still_dir = section_dir / "stills"
+        still_dir.mkdir(parents=True, exist_ok=True)
+        still_frames = set(
+            np.linspace(
+                start_frame,
+                end_frame,
+                min(int(stills_per_section), end_frame - start_frame + 1),
+                dtype=int,
+            ).tolist()
+        )
+
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            raise ValueError(f"Could not reopen video: {video_path}")
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        writer = None
+        clip_path = section_dir / f"{label}_color_mask_overlay.mp4"
+        processed = 0
+        try:
+            with tqdm(
+                total=end_frame - start_frame + 1,
+                desc=f"Saving {label} validation clip",
+            ) as pbar:
+                for frame_idx in range(start_frame, end_frame + 1):
+                    ok, frame = cap.read()
+                    if not ok:
+                        break
+                    _, mask, _ = segment_hsv_circle(
+                        frame,
+                        dish_center=dish_center,
+                        dish_radius=dish_radius,
+                        **hsv_params,
+                    )
+                    mask = mask.astype(bool)
+                    overlay = frame.copy().astype(np.float32)
+                    green = np.array([0, 255, 0], dtype=np.float32)
+                    overlay[mask] = (
+                        (1.0 - float(overlay_alpha)) * overlay[mask]
+                        + float(overlay_alpha) * green
+                    )
+                    overlay = np.clip(overlay, 0, 255).astype(np.uint8)
+                    contours, _ = cv2.findContours(
+                        mask.astype(np.uint8),
+                        cv2.RETR_EXTERNAL,
+                        cv2.CHAIN_APPROX_SIMPLE,
+                    )
+                    cv2.drawContours(overlay, contours, -1, (0, 0, 255), 3)
+                    cv2.putText(
+                        overlay,
+                        f"{label} | frame {frame_idx}/{total_frames - 1}",
+                        (30, 55),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        1.2,
+                        (255, 255, 255),
+                        3,
+                        cv2.LINE_AA,
+                    )
+                    cv2.putText(
+                        overlay,
+                        "green=body mask, red=mask boundary",
+                        (30, 100),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.9,
+                        (255, 255, 255),
+                        2,
+                        cv2.LINE_AA,
+                    )
+                    output_size = (
+                        max(1, int(round(frame.shape[1] * output_scale))),
+                        max(1, int(round(frame.shape[0] * output_scale))),
+                    )
+                    overlay_small = cv2.resize(
+                        overlay, output_size, interpolation=cv2.INTER_AREA
+                    )
+                    if writer is None:
+                        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                        writer = cv2.VideoWriter(
+                            str(clip_path),
+                            fourcc,
+                            source_fps if source_fps > 0 else 30.0,
+                            output_size,
+                            True,
+                        )
+                        if not writer.isOpened():
+                            raise ValueError(f"Could not open validation writer: {clip_path}")
+                    writer.write(overlay_small)
+
+                    if frame_idx in still_frames:
+                        original_small = cv2.resize(
+                            frame, output_size, interpolation=cv2.INTER_AREA
+                        )
+                        cv2.imwrite(
+                            str(still_dir / f"frame_{frame_idx:06d}_original.jpg"),
+                            original_small,
+                            [cv2.IMWRITE_JPEG_QUALITY, 92],
+                        )
+                        cv2.imwrite(
+                            str(still_dir / f"frame_{frame_idx:06d}_overlay.jpg"),
+                            overlay_small,
+                            [cv2.IMWRITE_JPEG_QUALITY, 92],
+                        )
+                    processed += 1
+                    pbar.update(1)
+        finally:
+            cap.release()
+            if writer is not None:
+                writer.release()
+
+        summary_rows.append(
+            {
+                "section": label,
+                "video_total_frames": total_frames,
+                "start_frame": start_frame,
+                "end_frame": end_frame,
+                "processed_frames": processed,
+                "output_scale": output_scale,
+                "clip_path": str(clip_path),
+                "stills_path": str(still_dir),
+            }
+        )
+        print(f"Saved {label} validation clip: {clip_path}")
+
+    summary = pd.DataFrame(summary_rows)
+    summary_csv = validation_dir / "validation_clips_summary.csv"
+    summary.to_csv(summary_csv, index=False, encoding="utf-8-sig")
+    print(f"Saved validation clip summary: {summary_csv}")
+    return summary
+
 def summarize_run(df, label):
     """
     Generate a one-row summary table for one experimental run.
@@ -2757,9 +3308,17 @@ if __name__ == "__main__":
     DISH_RADIUS = 760
     MANUAL_MASK_DIR = None  # Optional folder with hand-labeled masks for IoU/Dice validation.
     SEGMENT_TEST_FRAMES_PER_PART = 3
+    RUN_RELIABILITY_VALIDATION = False
+    RELIABILITY_SAMPLE_COUNT = 5
+    RELIABILITY_TOP_AREA_JUMPS = 8
+    RELIABILITY_VALIDATE_VEINS = True
+    RUN_LIGHTWEIGHT_VALIDATION_CLIPS = True
+    VALIDATION_CLIP_SECTION_FRAMES = 300
+    VALIDATION_CLIP_OUTPUT_SCALE = 0.5
+    VALIDATION_CLIP_STILLS_PER_SECTION = 6
 
     if OVERLAY_VALIDATION_MODE:
-        MAX_FRAMES = 900
+        MAX_FRAMES = 1800
         SAVE_OVERLAY_VIDEO = True
         OVERLAY_VIDEO_FPS = 30
         VEIN_EVERY_N_FRAMES = 10
@@ -2790,6 +3349,10 @@ if __name__ == "__main__":
     print(f"  CPU_WORKERS = {CPU_WORKERS}")
     print(f"  LOW_MEMORY_VIDEO_STREAM = {LOW_MEMORY_VIDEO_STREAM}")
     print(f"  PARALLEL_BATCH_FRAMES = {PARALLEL_BATCH_FRAMES}")
+    print(f"  RUN_RELIABILITY_VALIDATION = {RUN_RELIABILITY_VALIDATION}")
+    print(f"  RELIABILITY_VALIDATE_VEINS = {RELIABILITY_VALIDATE_VEINS}")
+    print(f"  RUN_LIGHTWEIGHT_VALIDATION_CLIPS = {RUN_LIGHTWEIGHT_VALIDATION_CLIPS}")
+    print(f"  VALIDATION_CLIP_SECTION_FRAMES = {VALIDATION_CLIP_SECTION_FRAMES}")
 
     hsv_params = dict(
         h_min=16,
@@ -2998,6 +3561,44 @@ if __name__ == "__main__":
     metrics_csv = out_dir / "plasmodium_metrics.csv"
     df.to_csv(metrics_csv, index=False, encoding="utf-8-sig")
     print(f"Saved metrics CSV: {metrics_csv}")
+
+    if RUN_LIGHTWEIGHT_VALIDATION_CLIPS:
+        if INPUT_MODE == "video" and SEGMENTATION_PROFILE == "hsv_circle":
+            save_lightweight_validation_clips(
+                input_path,
+                out_dir=out_dir,
+                dish_center=DISH_CENTER,
+                dish_radius=DISH_RADIUS,
+                hsv_params=hsv_params,
+                section_frames=VALIDATION_CLIP_SECTION_FRAMES,
+                output_scale=VALIDATION_CLIP_OUTPUT_SCALE,
+                stills_per_section=VALIDATION_CLIP_STILLS_PER_SECTION,
+            )
+        else:
+            warnings.warn(
+                "Lightweight validation clips currently require video input "
+                "with SEGMENTATION_PROFILE='hsv_circle'."
+            )
+    if RUN_RELIABILITY_VALIDATION:
+        if INPUT_MODE == "video" and SEGMENTATION_PROFILE == "hsv_circle":
+            validate_segmentation_reliability(
+                input_path,
+                metrics_df=df,
+                out_dir=out_dir,
+                dish_center=DISH_CENTER,
+                dish_radius=DISH_RADIUS,
+                hsv_params=hsv_params,
+                vein_params=vein_params,
+                pixel_size=PIXEL_SIZE,
+                sample_count=RELIABILITY_SAMPLE_COUNT,
+                top_area_jump_count=RELIABILITY_TOP_AREA_JUMPS,
+                validate_veins=RELIABILITY_VALIDATE_VEINS,
+            )
+        else:
+            warnings.warn(
+                "Reliability validation currently requires video input with "
+                "SEGMENTATION_PROFILE='hsv_circle'."
+            )
 
     summary_plot = out_dir / "plasmodium_summary.png"
     plot_summary(df, out_prefix=summary_plot)
