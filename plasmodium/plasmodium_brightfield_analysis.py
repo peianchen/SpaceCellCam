@@ -271,6 +271,114 @@ def keep_largest_component(mask):
     return (label_img == selected.label).astype(bool)
 
 
+def keep_components_touching_mask(candidate_mask, reference_mask):
+    """
+    Keep connected components in candidate_mask that overlap reference_mask.
+
+    This is used by relaxed HSV segmentation: low-saturation candidate pixels
+    are accepted only when their connected component touches a trusted seed
+    neighborhood.
+    """
+    candidate_mask = candidate_mask.astype(bool)
+    reference_mask = reference_mask.astype(bool)
+    if candidate_mask.shape != reference_mask.shape:
+        raise ValueError(
+            "candidate_mask and reference_mask must have the same shape: "
+            f"{candidate_mask.shape} vs {reference_mask.shape}"
+        )
+    if not np.any(candidate_mask) or not np.any(reference_mask):
+        return np.zeros_like(candidate_mask, dtype=bool)
+
+    label_img = measure.label(candidate_mask)
+    labels = np.unique(label_img[reference_mask & (label_img > 0)])
+    if labels.size == 0:
+        return np.zeros_like(candidate_mask, dtype=bool)
+    return np.isin(label_img, labels).astype(bool)
+
+
+
+def temporal_pale_branch_candidate(
+    frame,
+    dish_center,
+    dish_radius,
+    chroma_min=10,
+    min_channel=35,
+    max_value=240,
+    rim_exclusion_px=30,
+    min_obj_size=20,
+):
+    """Return low-threshold yellow candidate pixels for temporal recovery."""
+    if frame.ndim == 2:
+        bgr = cv2.cvtColor(_as_gray_uint8(frame), cv2.COLOR_GRAY2BGR)
+    else:
+        bgr = frame
+
+    blue, green, red = cv2.split(bgr.astype(np.int16))
+    yellow_chroma = np.minimum(red - blue, green - blue)
+    max_channel = np.maximum(np.maximum(red, green), blue)
+    inner_radius = int(dish_radius)
+    if rim_exclusion_px is not None and int(rim_exclusion_px) > 0:
+        inner_radius = max(1, int(dish_radius) - int(rim_exclusion_px))
+    inner_dish = circular_roi_mask(frame.shape[:2], dish_center, inner_radius)
+    candidate = (
+        (yellow_chroma >= int(chroma_min))
+        & (red >= int(min_channel))
+        & (green >= int(min_channel))
+        & (max_channel <= int(max_value))
+        & inner_dish
+    )
+    if min_obj_size and int(min_obj_size) > 0:
+        candidate = morphology.remove_small_objects(
+            candidate.astype(bool),
+            min_size=int(min_obj_size),
+        )
+    return candidate.astype(bool)
+
+
+def apply_temporal_body_recovery_to_sequence(
+    items,
+    window=5,
+    min_hits=4,
+    connect_radius=8,
+):
+    """
+    Add persistent pale branch pixels to ordered mask items.
+
+    Each item must contain: frame_idx, frame, mask, candidate.
+    The first/last half-window items are returned unchanged because they cannot
+    be checked symmetrically.
+    """
+    if not items:
+        return []
+    window = max(3, int(window))
+    if window % 2 == 0:
+        window += 1
+    min_hits = max(1, min(int(min_hits), window))
+    half_window = window // 2
+    connect_radius = max(1, int(connect_radius))
+    recovered = []
+    candidates = [item["candidate"].astype(bool) for item in items]
+
+    for pos, item in enumerate(items):
+        strict_mask = item["mask"].astype(bool)
+        addition = np.zeros_like(strict_mask, dtype=bool)
+        if half_window <= pos < len(items) - half_window:
+            local_candidates = candidates[pos - half_window:pos + half_window + 1]
+            hits = np.sum(np.stack(local_candidates, axis=0), axis=0)
+            consensus = hits >= min_hits
+            near_strict = morphology.binary_dilation(
+                strict_mask,
+                morphology.disk(connect_radius),
+            )
+            trusted = keep_components_touching_mask(consensus, near_strict)
+            addition = trusted & (~strict_mask)
+
+        final_mask = keep_largest_component(strict_mask | addition)
+        updated = dict(item)
+        updated["temporal_added_mask"] = addition & final_mask
+        updated["mask"] = final_mask
+        recovered.append(updated)
+    return recovered
 def preprocess_frame(
     gray,
     bg_method="morph_open",
@@ -777,6 +885,46 @@ def apply_vein_confidence(
     return out
 
 
+def apply_body_mask_confidence(df):
+    """Add trusted shape and body-skeleton columns from body-mask quality."""
+    if df is None or df.empty or "body_mask_confidence" not in df.columns:
+        return df
+    out = df.copy()
+    confidence = out["body_mask_confidence"].astype(str)
+    shape_trusted = confidence.isin(["high", "medium"])
+    skeleton_trusted = confidence == "high"
+    out["shape_metrics_trusted"] = shape_trusted
+    out["body_skeleton_trusted"] = skeleton_trusted
+    for col in ["perimeter_px", "perimeter", "circularity", "solidity"]:
+        if col in out.columns:
+            out[f"{col}_trusted"] = out[col].where(shape_trusted, np.nan)
+    for col in [
+        "skeleton_length_px", "skeleton_length", "n_branchpoints", "n_endpoints"
+    ]:
+        if col in out.columns:
+            out[f"{col}_trusted"] = out[col].where(skeleton_trusted, np.nan)
+    return out
+
+def add_body_area_derivatives(df, dt):
+    """Add comparable area-rate columns for occupied, clean, and envelope masks."""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    if dt is None or dt <= 0:
+        for name in ["occupied", "clean_body", "envelope"]:
+            out[f"{name}_dA_dt"] = np.nan
+        return out
+    for name, area_col in [
+        ("occupied", "occupied_area"),
+        ("clean_body", "clean_body_area"),
+        ("envelope", "envelope_area"),
+    ]:
+        if area_col in out.columns:
+            out[f"{name}_dA_dt"] = pd.to_numeric(
+                out[area_col], errors="coerce"
+            ).diff() / float(dt)
+    return out
+
 def expansion_retraction_metrics(prev_mask, curr_mask, dt, pixel_size=1.0, compute_front_speed=True):
     """
     Compute exploration and retraction metrics between consecutive masks.
@@ -903,6 +1051,54 @@ def circular_roi_mask(shape, center, radius):
     return (xx - cx) ** 2 + (yy - cy) ** 2 <= radius**2
 
 
+def body_mask_layer_metrics(occupied_mask, clean_mask, envelope_mask, pixel_size=1.0):
+    """Summarize the three body-mask layers used by HSV segmentation."""
+    occupied_mask = occupied_mask.astype(bool)
+    clean_mask = clean_mask.astype(bool)
+    envelope_mask = envelope_mask.astype(bool)
+    occupied_reg = region_metrics(occupied_mask, pixel_size=pixel_size)
+    envelope_reg = region_metrics(envelope_mask, pixel_size=pixel_size)
+    occupied_area_px = int(np.sum(occupied_mask))
+    clean_area_px = int(np.sum(clean_mask))
+    envelope_area_px = int(np.sum(envelope_mask))
+    filled_small_hole_area_px = max(0, clean_area_px - occupied_area_px)
+    remaining_hole_area_px = max(0, envelope_area_px - clean_area_px)
+    occupied_hole_fraction = (
+        float((envelope_area_px - occupied_area_px) / envelope_area_px)
+        if envelope_area_px > 0 else np.nan
+    )
+    remaining_hole_fraction = (
+        float(remaining_hole_area_px / envelope_area_px)
+        if envelope_area_px > 0 else np.nan
+    )
+    mask_confidence = (
+        "high" if np.isfinite(remaining_hole_fraction) and remaining_hole_fraction <= 0.05
+        else "medium" if np.isfinite(remaining_hole_fraction) and remaining_hole_fraction <= 0.15
+        else "low"
+    )
+    return {
+        "analysis_mask_type": "clean_body",
+        "occupied_area_px": occupied_area_px,
+        "occupied_area": float(occupied_area_px * pixel_size**2),
+        "occupied_perimeter_px": occupied_reg["perimeter_px"],
+        "occupied_perimeter": occupied_reg["perimeter"],
+        "occupied_circularity": occupied_reg["circularity"],
+        "occupied_solidity": occupied_reg["solidity"],
+        "clean_body_area_px": clean_area_px,
+        "clean_body_area": float(clean_area_px * pixel_size**2),
+        "envelope_area_px": envelope_area_px,
+        "envelope_area": float(envelope_area_px * pixel_size**2),
+        "envelope_perimeter_px": envelope_reg["perimeter_px"],
+        "envelope_perimeter": envelope_reg["perimeter"],
+        "envelope_circularity": envelope_reg["circularity"],
+        "envelope_solidity": envelope_reg["solidity"],
+        "filled_small_hole_area_px": filled_small_hole_area_px,
+        "remaining_hole_area_px": remaining_hole_area_px,
+        "occupied_hole_fraction": occupied_hole_fraction,
+        "remaining_hole_fraction": remaining_hole_fraction,
+        "body_mask_confidence": mask_confidence,
+    }
+
 def segment_hsv_circle(
     frame,
     dish_center,
@@ -916,12 +1112,36 @@ def segment_hsv_circle(
     morph_open_size=1,
     morph_close_size=0,
     keep_largest=True,
+    fill_small_body_holes=False,
+    body_hole_area_ratio=0.002,
+    body_min_hole_size=150,
+    body_max_hole_size=None,
+    use_yellow_chroma_extension=False,
+    yellow_chroma_min=20,
+    yellow_chroma_max_value=225,
+    yellow_chroma_min_channel=55,
+    yellow_chroma_rim_exclusion_px=8,
+    yellow_chroma_connect_radius=0,
+    yellow_chroma_connect_iterations=3,
+    use_relaxed_body_mask=False,
+    relaxed_h_min=14,
+    relaxed_h_max=55,
+    relaxed_s_min=25,
+    relaxed_v_min=35,
+    relaxed_connect_radius=30,
+    relaxed_min_obj_size=50,
+    rim_exclusion_px=40,
 ):
     """
-    Segment yellow plasmodium using one consistent HSV rule inside a dish circle.
+    Segment yellow plasmodium using HSV inside a dish circle.
 
-    This is intended for color time-lapse videos where plasmodium is yellow
-    and the dish/background is mostly gray or transparent.
+    Main output masks:
+    - occupied_mask: final visible plasmodium network mask.
+      It is the high-confidence HSV seed plus optional connected extension pixels.
+    - clean_mask: occupied_mask with optional conservative small-hole filling.
+    - envelope_mask: filled outer envelope of occupied_mask, used as coverage reference.
+
+    The high-confidence seed and optional extension masks are kept for debug/QC.
     """
     if frame.ndim == 2:
         bgr = cv2.cvtColor(_as_gray_uint8(frame), cv2.COLOR_GRAY2BGR)
@@ -930,28 +1150,149 @@ def segment_hsv_circle(
 
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     hue, sat, val = cv2.split(hsv)
-    mask = (
+    dish_mask = circular_roi_mask(frame.shape[:2], dish_center, dish_radius)
+
+    seed_mask = (
         (hue >= int(h_min))
         & (hue <= int(h_max))
         & (sat >= int(s_min))
         & (val >= int(v_min))
+        & dish_mask
     )
-    mask &= circular_roi_mask(frame.shape[:2], dish_center, dish_radius)
 
     if morph_open_size and morph_open_size > 0:
-        mask = morphology.binary_opening(mask, morphology.disk(int(morph_open_size)))
+        seed_mask = morphology.binary_opening(seed_mask, morphology.disk(int(morph_open_size)))
 
     if morph_close_size and morph_close_size > 0:
-        mask = morphology.binary_closing(mask, morphology.disk(int(morph_close_size)))
+        seed_mask = morphology.binary_closing(seed_mask, morphology.disk(int(morph_close_size)))
 
     if min_obj_size and min_obj_size > 0:
-        mask = morphology.remove_small_objects(mask.astype(bool), min_size=int(min_obj_size))
+        seed_mask = morphology.remove_small_objects(seed_mask.astype(bool), min_size=int(min_obj_size))
 
     if min_hole_size and min_hole_size > 0:
-        mask = morphology.remove_small_holes(mask.astype(bool), area_threshold=int(min_hole_size))
+        seed_mask = morphology.remove_small_holes(seed_mask.astype(bool), area_threshold=int(min_hole_size))
 
     if keep_largest:
-        mask = keep_largest_component(mask)
+        seed_mask = keep_largest_component(seed_mask)
+
+    yellow_chroma_candidate = np.zeros_like(seed_mask, dtype=bool)
+    yellow_chroma_added_mask = np.zeros_like(seed_mask, dtype=bool)
+    if use_yellow_chroma_extension and np.any(seed_mask):
+        blue, green, red = cv2.split(bgr.astype(np.int16))
+        yellow_chroma = np.minimum(red - blue, green - blue)
+        max_channel = np.maximum(np.maximum(red, green), blue)
+        yellow_chroma_candidate = (
+            (yellow_chroma >= int(yellow_chroma_min))
+            & (red >= int(yellow_chroma_min_channel))
+            & (green >= int(yellow_chroma_min_channel))
+            & (max_channel <= int(yellow_chroma_max_value))
+            & dish_mask
+        )
+        if (
+            yellow_chroma_rim_exclusion_px is not None
+            and int(yellow_chroma_rim_exclusion_px) > 0
+            and dish_radius is not None
+        ):
+            inner_radius = max(1, int(dish_radius) - int(yellow_chroma_rim_exclusion_px))
+            yellow_chroma_candidate &= circular_roi_mask(
+                frame.shape[:2], dish_center, inner_radius
+            )
+
+
+
+        connected_yellow = ndi.binary_propagation(
+            seed_mask,
+            structure=np.ones((3, 3), dtype=bool),
+            mask=(seed_mask | yellow_chroma_candidate),
+        )
+        connect_radius = max(0, int(yellow_chroma_connect_radius))
+        connect_iterations = max(0, int(yellow_chroma_connect_iterations))
+        if connect_radius > 0 and connect_iterations > 0:
+            for _ in range(connect_iterations):
+                nearby_mask = morphology.binary_dilation(
+                    connected_yellow,
+                    morphology.disk(connect_radius),
+                )
+                nearby_components = keep_components_touching_mask(
+                    yellow_chroma_candidate & (~connected_yellow),
+                    nearby_mask,
+                )
+                expanded_yellow = connected_yellow | nearby_components
+                if np.array_equal(expanded_yellow, connected_yellow):
+                    break
+                connected_yellow = expanded_yellow
+        yellow_chroma_added_mask = connected_yellow & (~seed_mask)
+    relaxed_candidate = np.zeros_like(seed_mask, dtype=bool)
+    relaxed_added_mask = np.zeros_like(seed_mask, dtype=bool)
+    seed_near_mask = np.zeros_like(seed_mask, dtype=bool)
+
+    if use_relaxed_body_mask and np.any(seed_mask):
+        relaxed_candidate = (
+            (hue >= int(relaxed_h_min))
+            & (hue <= int(relaxed_h_max))
+            & (sat >= int(relaxed_s_min))
+            & (val >= int(relaxed_v_min))
+            & dish_mask
+        )
+
+        if rim_exclusion_px is not None and int(rim_exclusion_px) > 0 and dish_radius is not None:
+            inner_radius = max(1, int(dish_radius) - int(rim_exclusion_px))
+            inner_dish_mask = circular_roi_mask(frame.shape[:2], dish_center, inner_radius)
+            relaxed_candidate &= inner_dish_mask
+
+        radius = max(1, int(relaxed_connect_radius))
+        seed_near_mask = morphology.binary_dilation(seed_mask, morphology.disk(radius))
+        relaxed_candidate &= seed_near_mask
+
+        if relaxed_min_obj_size and int(relaxed_min_obj_size) > 0:
+            relaxed_candidate = morphology.remove_small_objects(
+                relaxed_candidate.astype(bool),
+                min_size=int(relaxed_min_obj_size),
+            )
+
+        relaxed_added_mask = keep_components_touching_mask(
+            relaxed_candidate,
+            seed_near_mask,
+        )
+        relaxed_added_mask = relaxed_added_mask & (~seed_mask)
+
+    occupied_mask = (
+        seed_mask | yellow_chroma_added_mask | relaxed_added_mask
+    ).astype(bool)
+
+    if keep_largest:
+        occupied_mask = keep_largest_component(occupied_mask)
+        seed_mask = seed_mask & occupied_mask
+        yellow_chroma_added_mask = yellow_chroma_added_mask & occupied_mask
+        yellow_chroma_candidate = yellow_chroma_candidate & occupied_mask
+        relaxed_added_mask = relaxed_added_mask & occupied_mask
+        relaxed_candidate = relaxed_candidate & occupied_mask
+
+    envelope_mask = ndi.binary_fill_holes(occupied_mask).astype(bool)
+    clean_mask = occupied_mask.copy()
+    body_hole_threshold_px = 0
+    if fill_small_body_holes and np.any(occupied_mask):
+        raw_threshold = max(
+            int(body_min_hole_size),
+            int(round(np.sum(occupied_mask) * float(body_hole_area_ratio))),
+        )
+        if body_max_hole_size is not None and int(body_max_hole_size) > 0:
+            body_hole_threshold_px = min(int(body_max_hole_size), raw_threshold)
+        else:
+            body_hole_threshold_px = raw_threshold
+        clean_mask = morphology.remove_small_holes(
+            occupied_mask,
+            area_threshold=int(body_hole_threshold_px),
+        ).astype(bool)
+
+    seed_area_px = int(np.sum(seed_mask))
+    yellow_chroma_added_area_px = int(np.sum(yellow_chroma_added_mask))
+    relaxed_added_area_px = int(np.sum(relaxed_added_mask))
+    occupied_area_px = int(np.sum(occupied_mask))
+    yellow_chroma_added_fraction = float(
+        yellow_chroma_added_area_px / max(occupied_area_px, 1)
+    )
+    relaxed_added_fraction = float(relaxed_added_area_px / max(occupied_area_px, 1))
 
     debug = {
         "gray": _as_gray_uint8(frame),
@@ -961,9 +1302,64 @@ def segment_hsv_circle(
         "analysis_roi": None,
         "dish_center": dish_center,
         "dish_radius": dish_radius,
+        "seed_mask": seed_mask,
+        "yellow_chroma_candidate_mask": yellow_chroma_candidate,
+        "yellow_chroma_added_mask": yellow_chroma_added_mask,
+        "relaxed_candidate_mask": relaxed_candidate,
+        "relaxed_added_mask": relaxed_added_mask,
+        "occupied_mask": occupied_mask,
+        "clean_mask": clean_mask,
+        "envelope_mask": envelope_mask,
+        "body_hole_threshold_px": int(body_hole_threshold_px),
+        "body_hole_area_ratio": float(body_hole_area_ratio),
+        "body_min_hole_size": int(body_min_hole_size),
+        "body_max_hole_size": int(body_max_hole_size) if body_max_hole_size is not None else 0,
+        "seed_area_px": seed_area_px,
+        "yellow_chroma_added_area_px": yellow_chroma_added_area_px,
+        "yellow_chroma_added_fraction": yellow_chroma_added_fraction,
+        "use_yellow_chroma_extension": bool(use_yellow_chroma_extension),
+        "yellow_chroma_min": int(yellow_chroma_min),
+        "yellow_chroma_max_value": int(yellow_chroma_max_value),
+        "relaxed_added_area_px": relaxed_added_area_px,
+        "relaxed_added_fraction": relaxed_added_fraction,
+        "use_relaxed_body_mask": bool(use_relaxed_body_mask),
+        "relaxed_s_min": int(relaxed_s_min),
     }
-    return val, mask.astype(bool), debug
+    return val, clean_mask, debug
 
+def _body_mask_layers(mask, pre_debug, pixel_size=1.0):
+    """Return occupied, clean, envelope masks and their audit metrics."""
+    occupied_mask = pre_debug.get("occupied_mask", mask).astype(bool)
+    clean_mask = pre_debug.get("clean_mask", mask).astype(bool)
+    envelope_mask = pre_debug.get("envelope_mask", clean_mask).astype(bool)
+    metrics = body_mask_layer_metrics(
+        occupied_mask,
+        clean_mask,
+        envelope_mask,
+        pixel_size=pixel_size,
+    )
+    metrics["body_hole_threshold_px"] = int(
+        pre_debug.get("body_hole_threshold_px", 0)
+    )
+    metrics["seed_area_px"] = int(pre_debug.get("seed_area_px", np.sum(occupied_mask)))
+    metrics["yellow_chroma_added_area_px"] = int(
+        pre_debug.get("yellow_chroma_added_area_px", 0)
+    )
+    metrics["yellow_chroma_added_fraction"] = float(
+        pre_debug.get("yellow_chroma_added_fraction", 0.0)
+    )
+    metrics["use_yellow_chroma_extension"] = bool(
+        pre_debug.get("use_yellow_chroma_extension", False)
+    )
+    metrics["relaxed_added_area_px"] = int(pre_debug.get("relaxed_added_area_px", 0))
+    metrics["relaxed_added_fraction"] = float(
+        pre_debug.get("relaxed_added_fraction", 0.0)
+    )
+    metrics["use_relaxed_body_mask"] = bool(
+        pre_debug.get("use_relaxed_body_mask", False)
+    )
+    metrics["body_max_hole_size"] = int(pre_debug.get("body_max_hole_size", 0))
+    return occupied_mask, clean_mask, envelope_mask, metrics
 
 def preprocess_and_segment_frame(
     gray,
@@ -1068,6 +1464,7 @@ def overlay_mask_skeleton(
     retracted_region=None,
     vein_mask=None,
     vein_skeleton=None,
+    relaxed_added_mask=None,
     alpha=0.35,
 ):
     """
@@ -1097,6 +1494,7 @@ def overlay_mask_skeleton(
         overlay[binary_bool] = (1.0 - blend_alpha) * overlay[binary_bool] + blend_alpha * color_arr
 
     blend(mask, (0, 255, 0), alpha)
+    blend(relaxed_added_mask, (0, 255, 255), 0.70)
     blend(new_region, (255, 0, 255), 0.65)
     blend(retracted_region, (255, 165, 0), 0.65)
     blend(vein_mask, (0, 120, 255), 0.45)
@@ -1163,6 +1561,9 @@ def _analyze_single_frame_for_parallel(args):
             "segmentation_profile must be 'classic', 'grabcut_blob', or 'hsv_circle'."
         )
 
+    occupied_mask, mask, envelope_mask, body_layers = _body_mask_layers(
+        mask, pre_debug, pixel_size=pixel_size
+    )
     reg = region_metrics(mask, pixel_size=pixel_size)
     mask_qc = mask_qc_metrics(mask, analysis_roi=analysis_roi)
     skel = (
@@ -1179,7 +1580,7 @@ def _analyze_single_frame_for_parallel(args):
         frame,
         dish_center=dish_center,
         dish_radius=dish_radius,
-        body_mask=mask,
+        body_mask=occupied_mask,
         pixel_size=pixel_size,
         **vein_params,
     ) if compute_vein else None
@@ -1191,6 +1592,7 @@ def _analyze_single_frame_for_parallel(args):
         "focus_score": focus,
         **reg,
         **mask_qc,
+        **body_layers,
         "n_endpoints": skel["n_endpoints"],
         "n_branchpoints": skel["n_branchpoints"],
         "skeleton_length_px": skel["skeleton_length_px"],
@@ -1219,6 +1621,11 @@ def _analyze_single_frame_for_parallel(args):
             "gray": gray,
             "enhanced": enhanced,
             "mask": mask,
+            "occupied_mask": occupied_mask,
+            "seed_mask": pre_debug.get("seed_mask"),
+            "yellow_chroma_added_mask": pre_debug.get("yellow_chroma_added_mask"),
+            "relaxed_added_mask": pre_debug.get("relaxed_added_mask"),
+            "envelope_mask": envelope_mask,
             "skeleton": skel["skeleton"],
             "endpoint_mask": skel["endpoint_mask"],
             "branch_mask": skel["branch_mask"],
@@ -1367,6 +1774,8 @@ def analyze_timelapse(
 
         df = pd.DataFrame(rows)
         df = apply_vein_confidence(df)
+        df = apply_body_mask_confidence(df)
+        df = add_body_area_derivatives(df, dt)
         if roi is not None and "roi_mean_intensity" in df.columns:
             osc = analyze_oscillation(df["roi_mean_intensity"].to_numpy(), dt)
         else:
@@ -1402,6 +1811,9 @@ def analyze_timelapse(
                 "segmentation_profile must be 'classic', 'grabcut_blob', or 'hsv_circle'."
             )
 
+        occupied_mask, mask, envelope_mask, body_layers = _body_mask_layers(
+            mask, pre_debug, pixel_size=pixel_size
+        )
         reg = region_metrics(mask, pixel_size=pixel_size)
         mask_qc = mask_qc_metrics(mask, analysis_roi=analysis_roi)
         skel = (
@@ -1418,7 +1830,7 @@ def analyze_timelapse(
             frame,
             dish_center=dish_center,
             dish_radius=dish_radius,
-            body_mask=mask,
+            body_mask=occupied_mask,
             pixel_size=pixel_size,
             **vein_params,
         ) if compute_vein else None
@@ -1443,6 +1855,7 @@ def analyze_timelapse(
             "focus_score": focus,
             **reg,
             **mask_qc,
+            **body_layers,
             "dA_dt": dA_dt,
             "new_area_px": dyn["new_area_px"],
             "retracted_area_px": dyn["retracted_area_px"],
@@ -1483,6 +1896,11 @@ def analyze_timelapse(
                     "corrected": pre_debug["corrected"],
                     "enhanced": enhanced,
                     "mask": mask,
+                    "occupied_mask": occupied_mask,
+                    "seed_mask": pre_debug.get("seed_mask"),
+                    "yellow_chroma_added_mask": pre_debug.get("yellow_chroma_added_mask"),
+                    "relaxed_added_mask": pre_debug.get("relaxed_added_mask"),
+                    "envelope_mask": envelope_mask,
                     "skeleton": skel["skeleton"],
                     "endpoint_mask": skel["endpoint_mask"],
                     "branch_mask": skel["branch_mask"],
@@ -1498,6 +1916,8 @@ def analyze_timelapse(
 
     df = pd.DataFrame(rows)
     df = apply_vein_confidence(df)
+    df = apply_body_mask_confidence(df)
+    df = add_body_area_derivatives(df, dt)
     if roi is not None and "roi_mean_intensity" in df.columns:
         osc = analyze_oscillation(df["roi_mean_intensity"].to_numpy(), dt)
     else:
@@ -1599,6 +2019,9 @@ def analyze_video_stream(
                     "segmentation_profile must be 'classic', 'grabcut_blob', or 'hsv_circle'."
                 )
 
+            occupied_mask, mask, envelope_mask, body_layers = _body_mask_layers(
+                mask, pre_debug, pixel_size=pixel_size
+            )
             reg = region_metrics(mask, pixel_size=pixel_size)
             mask_qc = mask_qc_metrics(mask, analysis_roi=analysis_roi)
             skel = (
@@ -1615,7 +2038,7 @@ def analyze_video_stream(
                 frame_for_analysis,
                 dish_center=dish_center,
                 dish_radius=dish_radius,
-                body_mask=mask,
+                body_mask=occupied_mask,
                 pixel_size=pixel_size,
                 **vein_params,
             ) if compute_vein else None
@@ -1640,6 +2063,7 @@ def analyze_video_stream(
                 "focus_score": focus,
                 **reg,
                 **mask_qc,
+                **body_layers,
                 "dA_dt": dA_dt,
                 "new_area_px": dyn["new_area_px"],
                 "retracted_area_px": dyn["retracted_area_px"],
@@ -1682,6 +2106,11 @@ def analyze_video_stream(
                     "corrected": pre_debug["corrected"],
                     "enhanced": enhanced,
                     "mask": mask,
+                    "occupied_mask": occupied_mask,
+                    "seed_mask": pre_debug.get("seed_mask"),
+                    "yellow_chroma_added_mask": pre_debug.get("yellow_chroma_added_mask"),
+                    "relaxed_added_mask": pre_debug.get("relaxed_added_mask"),
+                    "envelope_mask": envelope_mask,
                     "skeleton": skel["skeleton"],
                     "endpoint_mask": skel["endpoint_mask"],
                     "branch_mask": skel["branch_mask"],
@@ -1701,6 +2130,7 @@ def analyze_video_stream(
                     branch_mask=skel["branch_mask"],
                     vein_mask=vein["vein_mask"] if vein is not None else None,
                     vein_skeleton=vein["vein_skeleton"] if vein is not None else None,
+                    relaxed_added_mask=pre_debug.get("relaxed_added_mask"),
                     new_region=dyn["new_region"],
                     retracted_region=dyn["retracted_region"],
                 )
@@ -1733,6 +2163,8 @@ def analyze_video_stream(
 
     df = pd.DataFrame(rows)
     df = apply_vein_confidence(df)
+    df = apply_body_mask_confidence(df)
+    df = add_body_area_derivatives(df, dt)
     if roi is not None and "roi_mean_intensity" in df.columns:
         osc = analyze_oscillation(df["roi_mean_intensity"].to_numpy(), dt)
     else:
@@ -1911,6 +2343,7 @@ def analyze_video_parallel_batches(
                                 branch_mask=debug_item["branch_mask"],
                                 vein_mask=debug_item["vein_mask"],
                                 vein_skeleton=debug_item["vein_skeleton"],
+                                relaxed_added_mask=debug_item.get("relaxed_added_mask"),
                                 new_region=dyn["new_region"],
                                 retracted_region=dyn["retracted_region"],
                             )
@@ -1954,6 +2387,8 @@ def analyze_video_parallel_batches(
         raise ValueError(f"No frames could be read from video: {video_path}")
 
     df = apply_vein_confidence(pd.DataFrame(rows))
+    df = apply_body_mask_confidence(df)
+    df = add_body_area_derivatives(df, dt)
     if roi is not None and "roi_mean_intensity" in df.columns:
         osc = analyze_oscillation(df["roi_mean_intensity"].to_numpy(), dt)
     else:
@@ -2167,6 +2602,7 @@ def save_debug_examples(
             retracted_region=item["retracted_region"],
             vein_mask=item.get("vein_mask"),
             vein_skeleton=item.get("vein_skeleton"),
+            relaxed_added_mask=item.get("relaxed_added_mask"),
         )
         overlay_bgr = cv2.cvtColor(overlay_rgb, cv2.COLOR_RGB2BGR)
 
@@ -2178,6 +2614,31 @@ def save_debug_examples(
         if "corrected" in item:
             cv2.imwrite(str(out_dir / f"{stem}_corrected.png"), _as_gray_uint8(item["corrected"]))
         cv2.imwrite(str(out_dir / f"{stem}_mask.png"), mask_u8)
+        if "occupied_mask" in item:
+            cv2.imwrite(
+                str(out_dir / f"{stem}_occupied_mask.png"),
+                item["occupied_mask"].astype(np.uint8) * 255,
+            )
+        if item.get("seed_mask") is not None:
+            cv2.imwrite(
+                str(out_dir / f"{stem}_seed_mask.png"),
+                item["seed_mask"].astype(np.uint8) * 255,
+            )
+        if item.get("yellow_chroma_added_mask") is not None:
+            cv2.imwrite(
+                str(out_dir / f"{stem}_yellow_chroma_added_mask.png"),
+                item["yellow_chroma_added_mask"].astype(np.uint8) * 255,
+            )
+        if item.get("relaxed_added_mask") is not None:
+            cv2.imwrite(
+                str(out_dir / f"{stem}_relaxed_added_mask.png"),
+                item["relaxed_added_mask"].astype(np.uint8) * 255,
+            )
+        if "envelope_mask" in item:
+            cv2.imwrite(
+                str(out_dir / f"{stem}_envelope_mask.png"),
+                item["envelope_mask"].astype(np.uint8) * 255,
+            )
         cv2.imwrite(str(out_dir / f"{stem}_overlay.png"), overlay_bgr)
 
 
@@ -2341,6 +2802,17 @@ def validate_analysis_qc(
     qc["flag_touch_roi_border"] = (
         qc["touch_roi_border"].fillna(False).astype(bool)
     )
+    qc["remaining_hole_fraction"] = (
+        pd.to_numeric(df["remaining_hole_fraction"], errors="coerce")
+        if "remaining_hole_fraction" in df.columns else np.nan
+    )
+    qc["body_mask_confidence"] = (
+        df["body_mask_confidence"].astype(str)
+        if "body_mask_confidence" in df.columns else "not_available"
+    )
+    qc["flag_low_body_mask_confidence"] = (
+        qc["body_mask_confidence"].astype(str) == "low"
+    )
 
     flag_cols = [
         "flag_empty_or_tiny",
@@ -2348,6 +2820,7 @@ def validate_analysis_qc(
         "flag_low_focus",
         "flag_area_fraction",
         "flag_touch_roi_border",
+        "flag_low_body_mask_confidence",
     ]
     qc["needs_review"] = qc[flag_cols].any(axis=1)
 
@@ -2377,6 +2850,594 @@ def validate_analysis_qc(
     print(f"QC frames needing review: {int(qc['needs_review'].sum())} / {len(qc)}")
     return qc
 
+
+def export_manual_validation_package(
+    video_path,
+    out_dir,
+    dish_center,
+    dish_radius,
+    hsv_params,
+    samples_per_section=10,
+    section_frames=300,
+):
+    """Export front/middle/rear images for manual ground-truth annotation."""
+    video_path = Path(video_path)
+    if not video_path.exists():
+        raise FileNotFoundError(f"Video does not exist: {video_path}")
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise ValueError(f"Could not open video: {video_path}")
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total_frames <= 0:
+        cap.release()
+        raise ValueError(f"Video frame count is unavailable: {video_path}")
+
+    section_frames = max(1, min(int(section_frames), total_frames))
+    starts = {
+        "front": 0,
+        "middle": max(0, (total_frames - section_frames) // 2),
+        "rear": max(0, total_frames - section_frames),
+    }
+    package_dir = Path(out_dir) / "manual_validation_package"
+    source_dir = package_dir / "source_images"
+    auto_dir = package_dir / "auto_masks"
+    overlay_dir = package_dir / "overlays"
+    manual_dir = package_dir / "manual_masks"
+    for folder in [source_dir, auto_dir, overlay_dir, manual_dir]:
+        folder.mkdir(parents=True, exist_ok=True)
+
+    rows = []
+    for section, start_frame in starts.items():
+        end_frame = min(total_frames - 1, start_frame + section_frames - 1)
+        sample_frames = np.linspace(
+            start_frame,
+            end_frame,
+            min(int(samples_per_section), end_frame - start_frame + 1),
+            dtype=int,
+        )
+        for frame_idx in sample_frames:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
+            ok, frame = cap.read()
+            if not ok:
+                warnings.warn(f"Could not read manual-validation frame {frame_idx}.")
+                continue
+            _, mask, _ = segment_hsv_circle(
+                frame,
+                dish_center=dish_center,
+                dish_radius=dish_radius,
+                **hsv_params,
+            )
+            mask = mask.astype(bool)
+            overlay = frame.copy().astype(np.float32)
+            overlay[mask] = 0.55 * overlay[mask] + 0.45 * np.array(
+                [0, 255, 0], dtype=np.float32
+            )
+            overlay = np.clip(overlay, 0, 255).astype(np.uint8)
+            contours, _ = cv2.findContours(
+                mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            cv2.drawContours(overlay, contours, -1, (0, 0, 255), 3)
+            stem = f"frame_{int(frame_idx):06d}"
+            source_path = source_dir / f"{stem}_original.jpg"
+            auto_path = auto_dir / f"{stem}_mask.png"
+            overlay_path = overlay_dir / f"{stem}_overlay.jpg"
+            manual_path = manual_dir / f"{stem}_mask.png"
+            cv2.imwrite(
+                str(source_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 95]
+            )
+            cv2.imwrite(str(auto_path), mask.astype(np.uint8) * 255)
+            cv2.imwrite(
+                str(overlay_path), overlay, [cv2.IMWRITE_JPEG_QUALITY, 95]
+            )
+            rows.append(
+                {
+                    "section": section,
+                    "frame": int(frame_idx),
+                    "video_total_frames": total_frames,
+                    "source_image": str(source_path),
+                    "auto_mask": str(auto_path),
+                    "overlay": str(overlay_path),
+                    "expected_manual_mask": str(manual_path),
+                    "manual_mask_ready": manual_path.exists(),
+                }
+            )
+    cap.release()
+
+    manifest = pd.DataFrame(rows).sort_values(["section", "frame"])
+    manifest_csv = package_dir / "manual_validation_manifest.csv"
+    manifest.to_csv(manifest_csv, index=False, encoding="utf-8-sig")
+    print(f"Saved manual validation package: {package_dir}")
+    print(f"Manual masks must be binary PNG files in: {manual_dir}")
+    return manifest
+
+
+def annotate_manual_validation_package(
+    package_dir,
+    display_scale=0.5,
+    brush_radius=4,
+    overlay_alpha=0.23,
+    start_image=None,
+):
+    """Correct draft masks in a fixed Tkinter viewport without built-in pan tools."""
+    import tkinter as tk
+    from PIL import Image, ImageTk
+
+    package_dir = Path(package_dir)
+    manifest_csv = package_dir / "manual_validation_manifest.csv"
+    if not manifest_csv.exists():
+        raise FileNotFoundError(f"Manifest does not exist: {manifest_csv}")
+    manifest = pd.read_csv(manifest_csv)
+    display_scale = float(np.clip(display_scale, 0.15, 4.0))
+    brush_radius = max(1, int(brush_radius))
+    overlay_alpha = float(np.clip(overlay_alpha, 0.0, 0.8))
+
+    if start_image is not None:
+        index = int(np.clip(int(start_image) - 1, 0, len(manifest) - 1))
+    else:
+        index = next(
+            (
+                i
+                for i, row in manifest.iterrows()
+                if not Path(row["expected_manual_mask"]).exists()
+            ),
+            0,
+        )
+    if index > 0:
+        print(f"Resuming manual annotation at {index + 1}/{len(manifest)}.")
+
+    while 0 <= index < len(manifest):
+        item = manifest.iloc[index]
+        source = cv2.imread(str(item["source_image"]), cv2.IMREAD_COLOR)
+        auto = cv2.imread(str(item["auto_mask"]), cv2.IMREAD_GRAYSCALE)
+        manual_path = Path(item["expected_manual_mask"])
+        existing = cv2.imread(str(manual_path), cv2.IMREAD_GRAYSCALE)
+        draft_path = (
+            package_dir
+            / "draft_masks"
+            / f"frame_{int(item['frame']):06d}_mask.png"
+        )
+        draft = cv2.imread(str(draft_path), cv2.IMREAD_GRAYSCALE)
+        if source is None or auto is None:
+            warnings.warn(f"Could not read annotation files for frame {item['frame']}.")
+            index += 1
+            continue
+
+        initial_mask = existing if existing is not None else draft if draft is not None else auto
+        mask = (initial_mask > 0).astype(np.uint8) * 255
+        image_height, image_width = mask.shape
+        state = {
+            "mode": "add",
+            "radius": brush_radius,
+            "last_point": None,
+            "drawing": False,
+            "panning": False,
+            "pan_start": None,
+            "center_start": None,
+            "show_overlay": True,
+            "action": "quit",
+            "scale": display_scale,
+            "center_x": image_width / 2.0,
+            "center_y": image_height / 2.0,
+            "photo": None,
+            "render_pending": False,
+        }
+
+        root = tk.Tk()
+        root.title("Manual mask editor")
+        try:
+            root.state("zoomed")
+        except tk.TclError:
+            root.geometry(
+                f"{max(960, root.winfo_screenwidth() - 40)}x"
+                f"{max(640, root.winfo_screenheight() - 90)}+0+0"
+            )
+
+        status_var = tk.StringVar()
+        status = tk.Label(
+            root,
+            textvariable=status_var,
+            anchor="w",
+            bg="#202020",
+            fg="white",
+            padx=10,
+            pady=6,
+            font=("Segoe UI", 9),
+        )
+        status.pack(fill=tk.X)
+        canvas = tk.Canvas(
+            root,
+            bg="#282828",
+            highlightthickness=0,
+            cursor="crosshair",
+        )
+        canvas.pack(fill=tk.BOTH, expand=True)
+        image_id = canvas.create_image(0, 0, anchor=tk.NW)
+        root.update_idletasks()
+
+        def viewport_size():
+            return max(1, canvas.winfo_width()), max(1, canvas.winfo_height())
+
+        def fit_view():
+            width, height = viewport_size()
+            state["scale"] = max(
+                0.05,
+                min(width / image_width, height / image_height),
+            )
+            state["center_x"] = image_width / 2.0
+            state["center_y"] = image_height / 2.0
+            request_render()
+
+        def clamp_center():
+            width, height = viewport_size()
+            half_x = width / (2.0 * state["scale"])
+            half_y = height / (2.0 * state["scale"])
+            if half_x >= image_width / 2.0:
+                state["center_x"] = image_width / 2.0
+            else:
+                state["center_x"] = float(
+                    np.clip(state["center_x"], half_x, image_width - half_x)
+                )
+            if half_y >= image_height / 2.0:
+                state["center_y"] = image_height / 2.0
+            else:
+                state["center_y"] = float(
+                    np.clip(state["center_y"], half_y, image_height - half_y)
+                )
+
+        def local_coordinates(event):
+            return (
+                event.x_root - canvas.winfo_rootx(),
+                event.y_root - canvas.winfo_rooty(),
+            )
+
+        def screen_to_image(x, y):
+            width, height = viewport_size()
+            image_x = state["center_x"] + (x - width / 2.0) / state["scale"]
+            image_y = state["center_y"] + (y - height / 2.0) / state["scale"]
+            return (
+                int(np.clip(round(image_x), 0, image_width - 1)),
+                int(np.clip(round(image_y), 0, image_height - 1)),
+            )
+
+        def update_status():
+            status_var.set(
+                f"{index + 1}/{len(manifest)} {item['section']} "
+                f"frame {int(item['frame'])} | {state['mode'].upper()} "
+                f"brush={state['radius']} zoom={state['scale']:.2f}x | "
+                "Left paint | Middle/right pan | Wheel zoom | A add | E erase | "
+                "[ ] brush | F fit | V overlay | R reset | C clear | "
+                "S save | P previous | Q quit"
+            )
+
+        def render_now():
+            state["render_pending"] = False
+            width, height = viewport_size()
+            preview = source.copy().astype(np.float32)
+            selected = mask > 0
+            if state["show_overlay"]:
+                preview[selected] = (
+                    (1.0 - overlay_alpha) * preview[selected]
+                    + overlay_alpha * np.array([0, 255, 0], dtype=np.float32)
+                )
+            preview = np.clip(preview, 0, 255).astype(np.uint8)
+            if state["show_overlay"]:
+                contours, _ = cv2.findContours(
+                    selected.astype(np.uint8),
+                    cv2.RETR_EXTERNAL,
+                    cv2.CHAIN_APPROX_SIMPLE,
+                )
+                cv2.drawContours(preview, contours, -1, (0, 0, 255), 1)
+            transform = np.array(
+                [
+                    [
+                        state["scale"],
+                        0.0,
+                        width / 2.0 - state["center_x"] * state["scale"],
+                    ],
+                    [
+                        0.0,
+                        state["scale"],
+                        height / 2.0 - state["center_y"] * state["scale"],
+                    ],
+                ],
+                dtype=np.float32,
+            )
+            rendered = cv2.warpAffine(
+                preview,
+                transform,
+                (width, height),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=(40, 40, 40),
+            )
+            rendered = cv2.cvtColor(rendered, cv2.COLOR_BGR2RGB)
+            state["photo"] = ImageTk.PhotoImage(
+                Image.fromarray(rendered),
+                master=root,
+            )
+            canvas.itemconfigure(image_id, image=state["photo"])
+            update_status()
+
+        def request_render():
+            if not state["render_pending"] and root.winfo_exists():
+                state["render_pending"] = True
+                root.after_idle(render_now)
+
+        def paint_to(point, start=False):
+            value = 255 if state["mode"] == "add" else 0
+            radius = state["radius"]
+            if start or state["last_point"] is None:
+                cv2.circle(mask, point, radius, value, -1)
+            else:
+                cv2.line(
+                    mask,
+                    state["last_point"],
+                    point,
+                    value,
+                    radius * 2,
+                    cv2.LINE_8,
+                )
+                cv2.circle(mask, point, radius, value, -1)
+            state["last_point"] = point
+            request_render()
+
+        def on_left_press(event):
+            state["drawing"] = True
+            state["panning"] = False
+            state["last_point"] = None
+            canvas.focus_set()
+            try:
+                canvas.grab_set()
+            except tk.TclError:
+                pass
+            x, y = local_coordinates(event)
+            paint_to(screen_to_image(x, y), start=True)
+            return "break"
+
+        def on_left_release(event):
+            if state["drawing"]:
+                x, y = local_coordinates(event)
+                paint_to(screen_to_image(x, y))
+            state["drawing"] = False
+            state["last_point"] = None
+            try:
+                canvas.grab_release()
+            except tk.TclError:
+                pass
+            return "break"
+
+        def on_pan_press(event):
+            state["panning"] = True
+            state["drawing"] = False
+            state["last_point"] = None
+            state["pan_start"] = local_coordinates(event)
+            state["center_start"] = (state["center_x"], state["center_y"])
+            canvas.config(cursor="fleur")
+            try:
+                canvas.grab_set()
+            except tk.TclError:
+                pass
+            return "break"
+
+        def on_pan_release(_event):
+            state["panning"] = False
+            canvas.config(cursor="crosshair")
+            try:
+                canvas.grab_release()
+            except tk.TclError:
+                pass
+            return "break"
+
+        def on_motion(event):
+            x, y = local_coordinates(event)
+            if state["drawing"]:
+                paint_to(screen_to_image(x, y))
+            elif state["panning"]:
+                dx = (x - state["pan_start"][0]) / state["scale"]
+                dy = (y - state["pan_start"][1]) / state["scale"]
+                state["center_x"] = state["center_start"][0] - dx
+                state["center_y"] = state["center_start"][1] - dy
+                clamp_center()
+                request_render()
+            return "break"
+
+        def zoom_at(x, y, factor):
+            anchor_x, anchor_y = screen_to_image(x, y)
+            width, height = viewport_size()
+            fit_scale = min(width / image_width, height / image_height)
+            new_scale = float(
+                np.clip(state["scale"] * factor, fit_scale * 0.5, 8.0)
+            )
+            if np.isclose(new_scale, state["scale"]):
+                return
+            state["scale"] = new_scale
+            state["center_x"] = anchor_x - (x - width / 2.0) / new_scale
+            state["center_y"] = anchor_y - (y - height / 2.0) / new_scale
+            clamp_center()
+            request_render()
+
+        def on_mouse_wheel(event):
+            x, y = local_coordinates(event)
+            zoom_at(x, y, 1.20 if event.delta > 0 else 1.0 / 1.20)
+            return "break"
+
+        def finish(action):
+            state["action"] = action
+            root.destroy()
+
+        def on_key(event):
+            key = event.keysym.lower()
+            if key in {"s", "n", "return"}:
+                manual_path.parent.mkdir(parents=True, exist_ok=True)
+                cv2.imwrite(str(manual_path), mask)
+                finish("next")
+            elif key == "p":
+                finish("previous")
+            elif key == "a":
+                state["mode"] = "add"
+                update_status()
+            elif key == "e":
+                state["mode"] = "erase"
+                update_status()
+            elif key == "v":
+                state["show_overlay"] = not state["show_overlay"]
+                request_render()
+            elif key == "r":
+                reset_mask = draft if draft is not None else auto
+                mask[:] = (reset_mask > 0).astype(np.uint8) * 255
+                request_render()
+            elif key == "c":
+                mask[:] = 0
+                request_render()
+            elif key == "bracketright":
+                state["radius"] = min(100, state["radius"] + 1)
+                update_status()
+            elif key == "bracketleft":
+                state["radius"] = max(1, state["radius"] - 1)
+                update_status()
+            elif key in {"plus", "equal", "kp_add"}:
+                width, height = viewport_size()
+                zoom_at(width // 2, height // 2, 1.20)
+            elif key in {"minus", "underscore", "kp_subtract"}:
+                width, height = viewport_size()
+                zoom_at(width // 2, height // 2, 1.0 / 1.20)
+            elif key == "f":
+                fit_view()
+            elif key in {"q", "escape"}:
+                finish("quit")
+
+        canvas.bind("<ButtonPress-1>", on_left_press)
+        canvas.bind("<ButtonRelease-1>", on_left_release)
+        for button in (2, 3):
+            canvas.bind(f"<ButtonPress-{button}>", on_pan_press)
+            canvas.bind(f"<ButtonRelease-{button}>", on_pan_release)
+        root.bind("<Motion>", on_motion)
+        canvas.bind("<MouseWheel>", on_mouse_wheel)
+        root.bind("<Key>", on_key)
+        root.bind("<Configure>", lambda _event: request_render())
+        root.protocol("WM_DELETE_WINDOW", lambda: finish("quit"))
+        fit_view()
+        root.focus_force()
+        root.mainloop()
+
+        if state["action"] == "next":
+            index += 1
+        elif state["action"] == "previous":
+            index = max(0, index - 1)
+        else:
+            print(f"Annotation stopped at {index}/{len(manifest)} images.")
+            return
+
+    print(f"Manual annotation complete: {len(manifest)} masks.")
+    validate_manual_validation_package(package_dir)
+
+def validate_manual_validation_package(package_dir):
+    """Calculate ground-truth accuracy after manual masks are completed."""
+    package_dir = Path(package_dir)
+    manifest_csv = package_dir / "manual_validation_manifest.csv"
+    if not manifest_csv.exists():
+        raise FileNotFoundError(f"Manifest does not exist: {manifest_csv}")
+    manifest = pd.read_csv(manifest_csv)
+    rows = []
+    for item in manifest.itertuples(index=False):
+        auto_path = Path(item.auto_mask)
+        manual_path = Path(item.expected_manual_mask)
+        if not manual_path.exists():
+            continue
+        auto = cv2.imread(str(auto_path), cv2.IMREAD_GRAYSCALE)
+        manual = cv2.imread(str(manual_path), cv2.IMREAD_GRAYSCALE)
+        if auto is None or manual is None:
+            warnings.warn(f"Could not read mask pair for frame {item.frame}.")
+            continue
+        if manual.shape != auto.shape:
+            manual = cv2.resize(
+                manual, (auto.shape[1], auto.shape[0]), interpolation=cv2.INTER_NEAREST
+            )
+        auto = auto > 0
+        manual = manual > 0
+        inter = int(np.sum(auto & manual))
+        union = int(np.sum(auto | manual))
+        auto_area = int(np.sum(auto))
+        manual_area = int(np.sum(manual))
+        iou = float(inter / union) if union > 0 else np.nan
+        dice = (
+            float(2 * inter / (auto_area + manual_area))
+            if auto_area + manual_area > 0 else np.nan
+        )
+        precision = float(inter / auto_area) if auto_area > 0 else np.nan
+        recall = float(inter / manual_area) if manual_area > 0 else np.nan
+        signed_area_error = (
+            float((auto_area - manual_area) / manual_area)
+            if manual_area > 0 else np.nan
+        )
+        rows.append(
+            {
+                "section": item.section,
+                "frame": int(item.frame),
+                "auto_area_px": auto_area,
+                "manual_area_px": manual_area,
+                "iou": iou,
+                "dice": dice,
+                "precision": precision,
+                "recall": recall,
+                "signed_area_error": signed_area_error,
+                "absolute_area_error": abs(signed_area_error),
+                "confidence": (
+                    "high" if dice >= 0.90
+                    else "trend_usable" if dice >= 0.80
+                    else "needs_tuning"
+                ),
+            }
+        )
+
+    result = pd.DataFrame(rows)
+    detail_csv = package_dir / "manual_validation_metrics.csv"
+    result.to_csv(detail_csv, index=False, encoding="utf-8-sig")
+    if result.empty:
+        print(
+            "No completed manual masks found. Add binary masks to "
+            f"{package_dir / 'manual_masks'}"
+        )
+        return result, pd.DataFrame()
+
+    section_summary = (
+        result.groupby("section", sort=False)
+        .agg(
+            n_masks=("frame", "count"),
+            iou_mean=("iou", "mean"),
+            iou_min=("iou", "min"),
+            dice_mean=("dice", "mean"),
+            dice_min=("dice", "min"),
+            precision_mean=("precision", "mean"),
+            recall_mean=("recall", "mean"),
+            absolute_area_error_mean=("absolute_area_error", "mean"),
+        )
+        .reset_index()
+    )
+    overall = pd.DataFrame(
+        [{
+            "section": "overall",
+            "n_masks": len(result),
+            "iou_mean": result["iou"].mean(),
+            "iou_min": result["iou"].min(),
+            "dice_mean": result["dice"].mean(),
+            "dice_min": result["dice"].min(),
+            "precision_mean": result["precision"].mean(),
+            "recall_mean": result["recall"].mean(),
+            "absolute_area_error_mean": result["absolute_area_error"].mean(),
+        }]
+    )
+    summary = pd.concat([section_summary, overall], ignore_index=True)
+    summary["confidence"] = np.select(
+        [summary["dice_mean"] >= 0.90, summary["dice_mean"] >= 0.80],
+        ["high", "trend_usable"],
+        default="needs_tuning",
+    )
+    summary_csv = package_dir / "manual_validation_summary.csv"
+    summary.to_csv(summary_csv, index=False, encoding="utf-8-sig")
+    print(f"Saved manual validation metrics: {detail_csv}")
+    print(f"Saved manual validation summary: {summary_csv}")
+    return result, summary
 
 def validate_against_manual_masks(debug_data, manual_mask_dir, out_csv):
     """
@@ -2827,22 +3888,493 @@ def validate_segmentation_reliability(
         )
     return frame_result, summary_result
 
+
+def _render_lightweight_validation_frame_for_parallel(args):
+    """
+    Render one lightweight validation overlay frame.
+
+    This helper is intentionally top-level so ProcessPoolExecutor can pickle it
+    on Windows/Spyder. Video reading and video writing stay in the parent
+    process; CPU-heavy HSV segmentation and overlay rendering run in workers.
+    """
+    (
+        frame_idx,
+        frame,
+        label,
+        total_frames,
+        dish_center,
+        dish_radius,
+        hsv_params,
+        output_scale,
+        overlay_alpha,
+        save_original,
+    ) = args
+
+    try:
+        cv2.setNumThreads(1)
+    except Exception:
+        pass
+
+    _, clean_mask, mask_debug = segment_hsv_circle(
+        frame,
+        dish_center=dish_center,
+        dish_radius=dish_radius,
+        **hsv_params,
+    )
+    occupied_mask = mask_debug["occupied_mask"].astype(bool)
+    yellow_chroma_added_mask = mask_debug.get(
+        "yellow_chroma_added_mask",
+        np.zeros_like(occupied_mask, dtype=bool),
+    ).astype(bool)
+    relaxed_added_mask = mask_debug.get(
+        "relaxed_added_mask",
+        np.zeros_like(occupied_mask, dtype=bool),
+    ).astype(bool)
+    clean_mask = clean_mask.astype(bool)
+    envelope_mask = mask_debug["envelope_mask"].astype(bool)
+    filled_small_holes = clean_mask & (~occupied_mask)
+    remaining_envelope_holes = envelope_mask & (~clean_mask)
+
+    overlay = frame.copy().astype(np.float32)
+
+    def blend_layer(binary, color, alpha):
+        if np.any(binary):
+            color_arr = np.asarray(color, dtype=np.float32)
+            overlay[binary] = (1.0 - alpha) * overlay[binary] + alpha * color_arr
+
+    # BGR colors because frame is BGR from cv2.VideoCapture.
+    blend_layer(occupied_mask, (0, 255, 0), float(overlay_alpha))
+    blend_layer(yellow_chroma_added_mask, (255, 255, 0), 0.70)  # cyan in BGR
+    blend_layer(relaxed_added_mask, (255, 255, 0), 0.70)
+    blend_layer(filled_small_holes, (255, 0, 255), 0.70)
+    # Keep internal gaps unpainted so the original image remains easy to inspect.
+    overlay = np.clip(overlay, 0, 255).astype(np.uint8)
+
+    clean_contours, _ = cv2.findContours(
+        clean_mask.astype(np.uint8),
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+    envelope_contours, _ = cv2.findContours(
+        envelope_mask.astype(np.uint8),
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+    cv2.drawContours(overlay, envelope_contours, -1, (255, 255, 0), 2)
+    cv2.drawContours(overlay, clean_contours, -1, (0, 0, 255), 3)
+    cv2.putText(
+        overlay,
+        f"{label} | frame {frame_idx}/{total_frames - 1}",
+        (30, 55),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.2,
+        (255, 255, 255),
+        3,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        overlay,
+        "green=occupied, cyan=focus/chroma-added, red=outer boundary",
+        (30, 100),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.9,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+
+    output_size = (
+        max(1, int(round(frame.shape[1] * float(output_scale)))),
+        max(1, int(round(frame.shape[0] * float(output_scale)))),
+    )
+    overlay_small = cv2.resize(overlay, output_size, interpolation=cv2.INTER_AREA)
+    original_small = None
+    if save_original:
+        original_small = cv2.resize(frame, output_size, interpolation=cv2.INTER_AREA)
+
+    return int(frame_idx), overlay_small, original_small
+
+
+
+def _scale_temporal_hsv_params(hsv_params, scale):
+    """Scale morphology/rim parameters when validating on resized frames."""
+    params = dict(hsv_params or {})
+    for key in ("min_obj_size", "min_hole_size", "body_min_hole_size", "body_max_hole_size"):
+        if key in params and params[key] is not None:
+            params[key] = max(1, int(round(float(params[key]) * scale * scale)))
+    for key in (
+        "morph_open_size",
+        "morph_close_size",
+        "yellow_chroma_rim_exclusion_px",
+        "yellow_chroma_connect_radius",
+        "relaxed_connect_radius",
+        "relaxed_min_obj_size",
+        "rim_exclusion_px",
+    ):
+        if key in params and params[key] is not None:
+            params[key] = max(0, int(round(float(params[key]) * scale)))
+    return params
+
+
+def _render_temporal_validation_overlay(
+    frame,
+    mask,
+    temporal_added_mask,
+    label,
+    frame_idx,
+    total_frames,
+    overlay_alpha,
+):
+    overlay = frame.copy().astype(np.float32)
+    mask = mask.astype(bool)
+    temporal_added_mask = temporal_added_mask.astype(bool)
+    if np.any(mask):
+        overlay[mask] = (1.0 - float(overlay_alpha)) * overlay[mask] + float(overlay_alpha) * np.array(
+            [0, 255, 0], dtype=np.float32
+        )
+    if np.any(temporal_added_mask):
+        overlay[temporal_added_mask] = 0.25 * overlay[temporal_added_mask] + 0.75 * np.array(
+            [255, 255, 0], dtype=np.float32
+        )
+    overlay = np.clip(overlay, 0, 255).astype(np.uint8)
+    contours, _ = cv2.findContours(
+        mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    cv2.drawContours(overlay, contours, -1, (0, 0, 255), 2)
+    cv2.putText(
+        overlay,
+        f"{label} | frame {frame_idx}/{total_frames - 1}",
+        (30, 55),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.2,
+        (255, 255, 255),
+        3,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        overlay,
+        "green=body, cyan=temporal-added, red=outer boundary",
+        (30, 100),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.9,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    return overlay
+
+
+
+def _prepare_temporal_validation_frame_for_parallel(args):
+    """Prepare one scaled frame for temporal validation in a worker process."""
+    (
+        frame_idx,
+        frame_small,
+        scaled_center,
+        scaled_radius,
+        scaled_hsv_params,
+        temporal_chroma_min,
+        temporal_min_channel,
+        temporal_max_value,
+        scaled_temporal_rim,
+        scaled_temporal_min_obj,
+    ) = args
+    try:
+        cv2.setNumThreads(1)
+    except Exception:
+        pass
+
+    _, mask, _ = segment_hsv_circle(
+        frame_small,
+        dish_center=scaled_center,
+        dish_radius=scaled_radius,
+        **scaled_hsv_params,
+    )
+    candidate = temporal_pale_branch_candidate(
+        frame_small,
+        dish_center=scaled_center,
+        dish_radius=scaled_radius,
+        chroma_min=temporal_chroma_min,
+        min_channel=temporal_min_channel,
+        max_value=temporal_max_value,
+        rim_exclusion_px=scaled_temporal_rim,
+        min_obj_size=scaled_temporal_min_obj,
+    )
+    return {
+        "frame_idx": int(frame_idx),
+        "frame": frame_small,
+        "mask": mask.astype(bool),
+        "candidate": candidate.astype(bool),
+    }
+def save_temporal_lightweight_validation_clips(
+    video_path,
+    out_dir,
+    dish_center,
+    dish_radius,
+    hsv_params,
+    sections=("front", "middle", "rear"),
+    section_frames=300,
+    output_scale=0.5,
+    stills_per_section=6,
+    overlay_alpha=0.40,
+    write_video=True,
+    skip_edge_frames=3,
+    temporal_window=5,
+    temporal_min_hits=4,
+    temporal_chroma_min=10,
+    temporal_min_channel=35,
+    temporal_max_value=240,
+    temporal_rim_exclusion_px=30,
+    temporal_connect_radius=8,
+    temporal_min_obj_size=20,
+    n_jobs=1,
+    batch_frames=32,
+):
+    """Save validation clips using hits-based temporal body-mask recovery."""
+    video_path = Path(video_path)
+    if not video_path.exists():
+        raise FileNotFoundError(f"Video does not exist: {video_path}")
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise ValueError(f"Could not open video: {video_path}")
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    source_fps = float(cap.get(cv2.CAP_PROP_FPS))
+    cap.release()
+    if total_frames <= 0:
+        raise ValueError(f"Video frame count is unavailable: {video_path}")
+
+    output_scale = float(np.clip(output_scale, 0.1, 1.0))
+    skip_edge_frames = max(0, int(skip_edge_frames or 0))
+    usable_start = min(skip_edge_frames, max(0, total_frames - 1))
+    usable_end = max(usable_start, total_frames - skip_edge_frames - 1)
+    usable_count = max(1, usable_end - usable_start + 1)
+    section_frames = max(1, min(int(section_frames), usable_count))
+    write_video = bool(write_video)
+    n_jobs = max(1, int(n_jobs or 1))
+    batch_frames = max(1, int(batch_frames or 1))
+    if n_jobs > 1:
+        batch_frames = max(n_jobs, batch_frames)
+
+    valid_sections = ("front", "middle", "rear")
+    if isinstance(sections, str):
+        sections = (sections,)
+    selected_sections = tuple(str(section).strip().lower() for section in sections)
+    invalid_sections = sorted(set(selected_sections) - set(valid_sections))
+    if invalid_sections:
+        raise ValueError(
+            f"Unknown validation section(s): {invalid_sections}. Use any of {valid_sections}."
+        )
+
+    starts = {
+        "front": usable_start,
+        "middle": usable_start + max(0, (usable_count - section_frames) // 2),
+        "rear": usable_end - section_frames + 1,
+    }
+    ranges = [
+        (label, starts[label])
+        for label in valid_sections
+        if label in selected_sections
+    ]
+
+    validation_dir = Path(out_dir) / "validation_clips"
+    if validation_dir.exists():
+        shutil.rmtree(validation_dir)
+    validation_dir.mkdir(parents=True, exist_ok=True)
+
+    scaled_center = (
+        int(round(dish_center[0] * output_scale)),
+        int(round(dish_center[1] * output_scale)),
+    )
+    scaled_radius = int(round(dish_radius * output_scale))
+    scaled_hsv_params = _scale_temporal_hsv_params(hsv_params, output_scale)
+    scaled_temporal_rim = max(1, int(round(temporal_rim_exclusion_px * output_scale)))
+    scaled_temporal_connect = max(1, int(round(temporal_connect_radius * output_scale)))
+    scaled_temporal_min_obj = max(1, int(round(temporal_min_obj_size * output_scale * output_scale)))
+
+    summary_rows = []
+    completed_starts = set()
+    for label, start_frame in ranges:
+        if start_frame in completed_starts:
+            continue
+        completed_starts.add(start_frame)
+        end_frame = min(usable_end, start_frame + section_frames - 1)
+        section_dir = validation_dir / label
+        still_dir = section_dir / "stills"
+        still_dir.mkdir(parents=True, exist_ok=True)
+        still_frames = set(
+            np.linspace(
+                start_frame,
+                end_frame,
+                min(int(stills_per_section), end_frame - start_frame + 1),
+                dtype=int,
+            ).tolist()
+        )
+
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            raise ValueError(f"Could not reopen video: {video_path}")
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        items = []
+        executor = ProcessPoolExecutor(max_workers=n_jobs) if n_jobs > 1 else None
+        try:
+            with tqdm(
+                total=end_frame - start_frame + 1,
+                desc=(
+                    f"Preparing temporal {label} validation with {n_jobs} CPU workers"
+                    if n_jobs > 1 else f"Preparing temporal {label} validation"
+                ),
+            ) as pbar:
+                next_frame = start_frame
+                while next_frame <= end_frame:
+                    work_items = []
+                    while len(work_items) < batch_frames and next_frame <= end_frame:
+                        ok, frame = cap.read()
+                        if not ok:
+                            break
+                        frame_small = cv2.resize(
+                            frame,
+                            None,
+                            fx=output_scale,
+                            fy=output_scale,
+                            interpolation=cv2.INTER_AREA,
+                        )
+                        work_items.append(
+                            (
+                                next_frame,
+                                frame_small,
+                                scaled_center,
+                                scaled_radius,
+                                scaled_hsv_params,
+                                temporal_chroma_min,
+                                temporal_min_channel,
+                                temporal_max_value,
+                                scaled_temporal_rim,
+                                scaled_temporal_min_obj,
+                            )
+                        )
+                        next_frame += 1
+
+                    if not work_items:
+                        break
+
+                    if executor is not None:
+                        prepared = list(executor.map(_prepare_temporal_validation_frame_for_parallel, work_items))
+                    else:
+                        prepared = [_prepare_temporal_validation_frame_for_parallel(item) for item in work_items]
+                    prepared.sort(key=lambda item: item["frame_idx"])
+                    items.extend(prepared)
+                    pbar.update(len(prepared))
+                    del work_items, prepared
+                    gc.collect()
+        finally:
+            cap.release()
+            if executor is not None:
+                executor.shutdown(wait=True)
+
+        recovered = apply_temporal_body_recovery_to_sequence(
+            items,
+            window=temporal_window,
+            min_hits=temporal_min_hits,
+            connect_radius=scaled_temporal_connect,
+        )
+        clip_path = section_dir / f"{label}_color_mask_overlay.mp4"
+        writer = None
+        added_fractions = []
+        try:
+            for item in tqdm(recovered, desc=f"Saving temporal {label} validation"):
+                frame_idx = int(item["frame_idx"])
+                mask = item["mask"].astype(bool)
+                addition = item.get("temporal_added_mask", np.zeros_like(mask, dtype=bool)).astype(bool)
+                if np.any(mask):
+                    added_fractions.append(float(addition.sum() / mask.sum()))
+                overlay = _render_temporal_validation_overlay(
+                    item["frame"],
+                    mask,
+                    addition,
+                    label,
+                    frame_idx,
+                    total_frames,
+                    overlay_alpha,
+                )
+                if write_video:
+                    if writer is None:
+                        height, width = overlay.shape[:2]
+                        writer = cv2.VideoWriter(
+                            str(clip_path),
+                            cv2.VideoWriter_fourcc(*"mp4v"),
+                            source_fps if source_fps > 0 else 30.0,
+                            (width, height),
+                            True,
+                        )
+                        if not writer.isOpened():
+                            raise ValueError(f"Could not open validation writer: {clip_path}")
+                    writer.write(overlay)
+
+                if frame_idx in still_frames:
+                    cv2.imwrite(
+                        str(still_dir / f"frame_{frame_idx:06d}_original.jpg"),
+                        item["frame"],
+                        [cv2.IMWRITE_JPEG_QUALITY, 92],
+                    )
+                    cv2.imwrite(
+                        str(still_dir / f"frame_{frame_idx:06d}_overlay.jpg"),
+                        overlay,
+                        [cv2.IMWRITE_JPEG_QUALITY, 92],
+                    )
+        finally:
+            if writer is not None:
+                writer.release()
+
+        summary_rows.append(
+            {
+                "section": label,
+                "video_total_frames": total_frames,
+                "start_frame": start_frame,
+                "end_frame": end_frame,
+                "processed_frames": len(recovered),
+                "output_scale": output_scale,
+                "write_video": write_video,
+                "temporal_window": temporal_window,
+                "temporal_min_hits": temporal_min_hits,
+                "temporal_chroma_min": temporal_chroma_min,
+                "temporal_rim_exclusion_px": temporal_rim_exclusion_px,
+                "temporal_connect_radius": temporal_connect_radius,
+                "mean_temporal_added_fraction": float(np.nanmean(added_fractions)) if added_fractions else np.nan,
+                "clip_path": str(clip_path) if write_video else "not_written",
+                "stills_path": str(still_dir),
+            }
+        )
+
+        del items, recovered
+        gc.collect()
+
+    summary_df = pd.DataFrame(summary_rows)
+    summary_csv = validation_dir / "validation_clips_summary.csv"
+    summary_df.to_csv(summary_csv, index=False, encoding="utf-8-sig")
+    print(f"Saved temporal validation clips: {validation_dir}")
+    print(f"Saved validation summary: {summary_csv}")
+    return summary_df
 def save_lightweight_validation_clips(
     video_path,
     out_dir,
     dish_center,
     dish_radius,
     hsv_params,
+    sections=("front", "middle", "rear"),
     section_frames=300,
     output_scale=0.5,
     stills_per_section=6,
     overlay_alpha=0.40,
+    n_jobs=1,
+    batch_frames=32,
+    write_video=True,
 ):
     """
-    Save low-resource color overlay clips for the full video's front/middle/rear.
+    Save color overlay clips/stills for selected parts of the full video.
 
-    Only body segmentation is computed. Skeleton, vein, front-speed, and full
-    metric analysis are intentionally skipped to keep CPU and memory use low.
+    Body segmentation and overlay rendering can run in parallel. The parent
+    process still reads source frames and writes mp4 files in frame order, because
+    VideoCapture/VideoWriter are safer and more reliable when kept single-writer.
     """
     video_path = Path(video_path)
     if not video_path.exists():
@@ -2856,12 +4388,40 @@ def save_lightweight_validation_clips(
     if total_frames <= 0:
         raise ValueError(f"Video frame count is unavailable: {video_path}")
 
+    n_jobs = max(1, int(n_jobs or 1))
+    batch_frames = max(1, int(batch_frames or 1))
+    if n_jobs > 1:
+        batch_frames = max(n_jobs, batch_frames)
     section_frames = max(1, min(int(section_frames), total_frames))
     output_scale = float(np.clip(output_scale, 0.1, 1.0))
+    write_video = bool(write_video)
+    n_jobs = max(1, int(n_jobs or 1))
+    batch_frames = max(1, int(batch_frames or 1))
+    if n_jobs > 1:
+        batch_frames = max(n_jobs, batch_frames)
+
+    valid_sections = ("front", "middle", "rear")
+    if isinstance(sections, str):
+        sections = (sections,)
+    selected_sections = tuple(str(section).strip().lower() for section in sections)
+    invalid_sections = sorted(set(selected_sections) - set(valid_sections))
+    if invalid_sections:
+        raise ValueError(
+            f"Unknown validation section(s): {invalid_sections}. "
+            f"Use any of {valid_sections}."
+        )
+    if not selected_sections:
+        raise ValueError("At least one validation section must be selected.")
+
+    starts = {
+        "front": 0,
+        "middle": max(0, (total_frames - section_frames) // 2),
+        "rear": max(0, total_frames - section_frames),
+    }
     ranges = [
-        ("front", 0),
-        ("middle", max(0, (total_frames - section_frames) // 2)),
-        ("rear", max(0, total_frames - section_frames)),
+        (label, starts[label])
+        for label in valid_sections
+        if label in selected_sections
     ]
     validation_dir = Path(out_dir) / "validation_clips"
     if validation_dir.exists():
@@ -2894,95 +4454,87 @@ def save_lightweight_validation_clips(
         writer = None
         clip_path = section_dir / f"{label}_color_mask_overlay.mp4"
         processed = 0
+        next_frame = start_frame
+
+        executor = ProcessPoolExecutor(max_workers=n_jobs) if n_jobs > 1 else None
         try:
             with tqdm(
                 total=end_frame - start_frame + 1,
-                desc=f"Saving {label} validation clip",
+                desc=(
+                    f"Saving {label} validation clip with {n_jobs} CPU workers"
+                    if n_jobs > 1 else f"Saving {label} validation clip"
+                ),
             ) as pbar:
-                for frame_idx in range(start_frame, end_frame + 1):
-                    ok, frame = cap.read()
-                    if not ok:
-                        break
-                    _, mask, _ = segment_hsv_circle(
-                        frame,
-                        dish_center=dish_center,
-                        dish_radius=dish_radius,
-                        **hsv_params,
-                    )
-                    mask = mask.astype(bool)
-                    overlay = frame.copy().astype(np.float32)
-                    green = np.array([0, 255, 0], dtype=np.float32)
-                    overlay[mask] = (
-                        (1.0 - float(overlay_alpha)) * overlay[mask]
-                        + float(overlay_alpha) * green
-                    )
-                    overlay = np.clip(overlay, 0, 255).astype(np.uint8)
-                    contours, _ = cv2.findContours(
-                        mask.astype(np.uint8),
-                        cv2.RETR_EXTERNAL,
-                        cv2.CHAIN_APPROX_SIMPLE,
-                    )
-                    cv2.drawContours(overlay, contours, -1, (0, 0, 255), 3)
-                    cv2.putText(
-                        overlay,
-                        f"{label} | frame {frame_idx}/{total_frames - 1}",
-                        (30, 55),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        1.2,
-                        (255, 255, 255),
-                        3,
-                        cv2.LINE_AA,
-                    )
-                    cv2.putText(
-                        overlay,
-                        "green=body mask, red=mask boundary",
-                        (30, 100),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.9,
-                        (255, 255, 255),
-                        2,
-                        cv2.LINE_AA,
-                    )
-                    output_size = (
-                        max(1, int(round(frame.shape[1] * output_scale))),
-                        max(1, int(round(frame.shape[0] * output_scale))),
-                    )
-                    overlay_small = cv2.resize(
-                        overlay, output_size, interpolation=cv2.INTER_AREA
-                    )
-                    if writer is None:
-                        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                        writer = cv2.VideoWriter(
-                            str(clip_path),
-                            fourcc,
-                            source_fps if source_fps > 0 else 30.0,
-                            output_size,
-                            True,
+                while next_frame <= end_frame:
+                    work_items = []
+                    while len(work_items) < batch_frames and next_frame <= end_frame:
+                        ok, frame = cap.read()
+                        if not ok:
+                            break
+                        work_items.append(
+                            (
+                                next_frame,
+                                frame,
+                                label,
+                                total_frames,
+                                dish_center,
+                                dish_radius,
+                                hsv_params,
+                                output_scale,
+                                overlay_alpha,
+                                next_frame in still_frames,
+                            )
                         )
-                        if not writer.isOpened():
-                            raise ValueError(f"Could not open validation writer: {clip_path}")
-                    writer.write(overlay_small)
+                        next_frame += 1
 
-                    if frame_idx in still_frames:
-                        original_small = cv2.resize(
-                            frame, output_size, interpolation=cv2.INTER_AREA
-                        )
-                        cv2.imwrite(
-                            str(still_dir / f"frame_{frame_idx:06d}_original.jpg"),
-                            original_small,
-                            [cv2.IMWRITE_JPEG_QUALITY, 92],
-                        )
-                        cv2.imwrite(
-                            str(still_dir / f"frame_{frame_idx:06d}_overlay.jpg"),
-                            overlay_small,
-                            [cv2.IMWRITE_JPEG_QUALITY, 92],
-                        )
-                    processed += 1
-                    pbar.update(1)
+                    if not work_items:
+                        break
+
+                    if executor is not None:
+                        rendered = list(executor.map(_render_lightweight_validation_frame_for_parallel, work_items))
+                    else:
+                        rendered = [_render_lightweight_validation_frame_for_parallel(item) for item in work_items]
+                    rendered.sort(key=lambda item: item[0])
+
+                    for frame_idx, overlay_small, original_small in rendered:
+                        if write_video:
+                            if writer is None:
+                                height, width = overlay_small.shape[:2]
+                                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                                writer = cv2.VideoWriter(
+                                    str(clip_path),
+                                    fourcc,
+                                    source_fps if source_fps > 0 else 30.0,
+                                    (width, height),
+                                    True,
+                                )
+                                if not writer.isOpened():
+                                    raise ValueError(f"Could not open validation writer: {clip_path}")
+                            writer.write(overlay_small)
+
+                        if frame_idx in still_frames:
+                            if original_small is not None:
+                                cv2.imwrite(
+                                    str(still_dir / f"frame_{frame_idx:06d}_original.jpg"),
+                                    original_small,
+                                    [cv2.IMWRITE_JPEG_QUALITY, 92],
+                                )
+                            cv2.imwrite(
+                                str(still_dir / f"frame_{frame_idx:06d}_overlay.jpg"),
+                                overlay_small,
+                                [cv2.IMWRITE_JPEG_QUALITY, 92],
+                            )
+                        processed += 1
+                        pbar.update(1)
+
+                    del work_items, rendered
+                    gc.collect()
         finally:
             cap.release()
             if writer is not None:
                 writer.release()
+            if executor is not None:
+                executor.shutdown(wait=True)
 
         summary_rows.append(
             {
@@ -2992,17 +4544,24 @@ def save_lightweight_validation_clips(
                 "end_frame": end_frame,
                 "processed_frames": processed,
                 "output_scale": output_scale,
-                "clip_path": str(clip_path),
+                "n_jobs": n_jobs,
+                "batch_frames": batch_frames,
+                "write_video": write_video,
+                "clip_path": str(clip_path) if write_video else "not_written",
                 "stills_path": str(still_dir),
             }
         )
-        print(f"Saved {label} validation clip: {clip_path}")
+        if write_video:
+            print(f"Saved {label} validation clip: {clip_path}")
+        else:
+            print(f"Saved {label} validation stills: {still_dir}")
 
     summary = pd.DataFrame(summary_rows)
     summary_csv = validation_dir / "validation_clips_summary.csv"
     summary.to_csv(summary_csv, index=False, encoding="utf-8-sig")
     print(f"Saved validation clip summary: {summary_csv}")
     return summary
+
 
 def summarize_run(df, label):
     """
@@ -3035,11 +4594,28 @@ def summarize_run(df, label):
                 "front_speed_mean": mean_col("front_speed_mean"),
                 "explore_ratio_mean": mean_col("explore_ratio"),
                 "retreat_ratio_mean": mean_col("retreat_ratio"),
-                "circularity_mean": mean_col("circularity"),
-                "solidity_mean": mean_col("solidity"),
-                "branchpoints_mean": mean_col("n_branchpoints"),
-                "endpoints_mean": mean_col("n_endpoints"),
-                "skeleton_length_mean": mean_col("skeleton_length"),
+                "circularity_mean": mean_col(
+                    "circularity_trusted" if "circularity_trusted" in df.columns else "circularity"
+                ),
+                "solidity_mean": mean_col(
+                    "solidity_trusted" if "solidity_trusted" in df.columns else "solidity"
+                ),
+                "branchpoints_mean": mean_col(
+                    "n_branchpoints_trusted" if "n_branchpoints_trusted" in df.columns else "n_branchpoints"
+                ),
+                "endpoints_mean": mean_col(
+                    "n_endpoints_trusted" if "n_endpoints_trusted" in df.columns else "n_endpoints"
+                ),
+                "skeleton_length_mean": mean_col(
+                    "skeleton_length_trusted" if "skeleton_length_trusted" in df.columns else "skeleton_length"
+                ),
+                "body_mask_high_fraction": float(
+                    np.mean(df["body_mask_confidence"].astype(str) == "high")
+                ) if "body_mask_confidence" in df.columns else np.nan,
+                "body_mask_low_fraction": float(
+                    np.mean(df["body_mask_confidence"].astype(str) == "low")
+                ) if "body_mask_confidence" in df.columns else np.nan,
+                "remaining_hole_fraction_mean": mean_col("remaining_hole_fraction"),
             }
         ]
     )
@@ -3305,7 +4881,7 @@ if __name__ == "__main__":
     SEGMENTATION_PROFILE = "hsv_circle"  # "hsv_circle", "classic", or "grabcut_blob"
     ANALYSIS_ROI = (700, 520, 850, 700)  # Used only by "classic" / "grabcut_blob".
     DISH_CENTER = (1280, 960)  # x, y. Adjust once per camera setup if needed.
-    DISH_RADIUS = 760
+    DISH_RADIUS = 750
     MANUAL_MASK_DIR = None  # Optional folder with hand-labeled masks for IoU/Dice validation.
     SEGMENT_TEST_FRAMES_PER_PART = 3
     RUN_RELIABILITY_VALIDATION = False
@@ -3313,9 +4889,26 @@ if __name__ == "__main__":
     RELIABILITY_TOP_AREA_JUMPS = 8
     RELIABILITY_VALIDATE_VEINS = True
     RUN_LIGHTWEIGHT_VALIDATION_CLIPS = True
+    VALIDATION_ONLY_MODE = True
+    VALIDATION_CLIP_SECTIONS = ("front", "middle", "rear")
+    #VALIDATION_CLIP_SECTIONS = ("front", "rear")
+    #VALIDATION_CLIP_SECTIONS = ("rear")
     VALIDATION_CLIP_SECTION_FRAMES = 300
     VALIDATION_CLIP_OUTPUT_SCALE = 0.5
     VALIDATION_CLIP_STILLS_PER_SECTION = 6
+    VALIDATION_CLIP_CPU_WORKERS = CPU_WORKERS
+    VALIDATION_CLIP_BATCH_FRAMES = 48
+    VALIDATION_CLIP_WRITE_VIDEO = True
+    USE_TEMPORAL_BODY_RECOVERY = True
+    TEMPORAL_SKIP_EDGE_FRAMES = 3
+    TEMPORAL_WINDOW = 5
+    TEMPORAL_MIN_HITS = 4
+    TEMPORAL_CHROMA_MIN = 14
+    TEMPORAL_MIN_CHANNEL = 45
+    TEMPORAL_MAX_VALUE = 235
+    TEMPORAL_RIM_EXCLUSION_PX = 30
+    TEMPORAL_CONNECT_RADIUS = 6
+    TEMPORAL_MIN_OBJ_SIZE = 20
 
     if OVERLAY_VALIDATION_MODE:
         MAX_FRAMES = 1800
@@ -3352,18 +4945,55 @@ if __name__ == "__main__":
     print(f"  RUN_RELIABILITY_VALIDATION = {RUN_RELIABILITY_VALIDATION}")
     print(f"  RELIABILITY_VALIDATE_VEINS = {RELIABILITY_VALIDATE_VEINS}")
     print(f"  RUN_LIGHTWEIGHT_VALIDATION_CLIPS = {RUN_LIGHTWEIGHT_VALIDATION_CLIPS}")
+    print(f"  VALIDATION_ONLY_MODE = {VALIDATION_ONLY_MODE}")
+    print(f"  VALIDATION_CLIP_SECTIONS = {VALIDATION_CLIP_SECTIONS}")
     print(f"  VALIDATION_CLIP_SECTION_FRAMES = {VALIDATION_CLIP_SECTION_FRAMES}")
+    print(f"  VALIDATION_CLIP_CPU_WORKERS = {VALIDATION_CLIP_CPU_WORKERS}")
+    print(f"  VALIDATION_CLIP_BATCH_FRAMES = {VALIDATION_CLIP_BATCH_FRAMES}")
+    print(f"  VALIDATION_CLIP_WRITE_VIDEO = {VALIDATION_CLIP_WRITE_VIDEO}")
+    print(f"  USE_TEMPORAL_BODY_RECOVERY = {USE_TEMPORAL_BODY_RECOVERY}")
+    print(f"  TEMPORAL_SKIP_EDGE_FRAMES = {TEMPORAL_SKIP_EDGE_FRAMES}")
+    print(f"  TEMPORAL_WINDOW = {TEMPORAL_WINDOW}")
+    print(f"  TEMPORAL_MIN_HITS = {TEMPORAL_MIN_HITS}")
+    print(f"  TEMPORAL_CHROMA_MIN = {TEMPORAL_CHROMA_MIN}")
+    print(f"  TEMPORAL_RIM_EXCLUSION_PX = {TEMPORAL_RIM_EXCLUSION_PX}")
+    print(f"  TEMPORAL_CONNECT_RADIUS = {TEMPORAL_CONNECT_RADIUS}")
 
     hsv_params = dict(
-        h_min=16,
-        h_max=48,
-        s_min=60,
-        v_min=45,
+        h_min=15,
+        h_max=49,
+        s_min=54,
+        v_min=30,
         min_obj_size=150,
         min_hole_size=0,
         morph_open_size=1,
         morph_close_size=0,
         keep_largest=True,
+        # One global parameter set calibrated against 30 front/middle/rear masks.
+        # The rear reference masks use AI threshold 0.70 to recover pale branches.
+        fill_small_body_holes=False,
+        use_yellow_chroma_extension=True,
+        yellow_chroma_min=23,
+        yellow_chroma_max_value=225,
+        yellow_chroma_min_channel=55,
+        yellow_chroma_rim_exclusion_px=20,
+        #yellow_chroma_min=30,
+        #yellow_chroma_max_value=236,
+        #yellow_chroma_min_channel=68,
+        #yellow_chroma_rim_exclusion_px=8,
+        yellow_chroma_connect_radius=0,
+        yellow_chroma_connect_iterations=3,
+        body_hole_area_ratio=0.0005,
+        body_min_hole_size=50,
+        body_max_hole_size=150,
+        use_relaxed_body_mask=False,
+        relaxed_h_min=14,
+        relaxed_h_max=55,
+        relaxed_s_min=25,
+        relaxed_v_min=35,
+        relaxed_connect_radius=30,
+        relaxed_min_obj_size=50,
+        rim_exclusion_px=40,
     )
 
     vein_params = dict(
@@ -3413,6 +5043,55 @@ if __name__ == "__main__":
 
     out_dir = Path(OUTPUT_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    if VALIDATION_ONLY_MODE:
+        if INPUT_MODE != "video" or SEGMENTATION_PROFILE != "hsv_circle":
+            raise ValueError(
+                "VALIDATION_ONLY_MODE requires INPUT_MODE='video' and "
+                "SEGMENTATION_PROFILE='hsv_circle'."
+            )
+        if USE_TEMPORAL_BODY_RECOVERY:
+            save_temporal_lightweight_validation_clips(
+                input_path,
+                out_dir=out_dir,
+                dish_center=DISH_CENTER,
+                dish_radius=DISH_RADIUS,
+                hsv_params=hsv_params,
+                sections=VALIDATION_CLIP_SECTIONS,
+                section_frames=VALIDATION_CLIP_SECTION_FRAMES,
+                output_scale=VALIDATION_CLIP_OUTPUT_SCALE,
+                stills_per_section=VALIDATION_CLIP_STILLS_PER_SECTION,
+                write_video=VALIDATION_CLIP_WRITE_VIDEO,
+                skip_edge_frames=TEMPORAL_SKIP_EDGE_FRAMES,
+                temporal_window=TEMPORAL_WINDOW,
+                temporal_min_hits=TEMPORAL_MIN_HITS,
+                temporal_chroma_min=TEMPORAL_CHROMA_MIN,
+                temporal_min_channel=TEMPORAL_MIN_CHANNEL,
+                temporal_max_value=TEMPORAL_MAX_VALUE,
+                temporal_rim_exclusion_px=TEMPORAL_RIM_EXCLUSION_PX,
+                temporal_connect_radius=TEMPORAL_CONNECT_RADIUS,
+                temporal_min_obj_size=TEMPORAL_MIN_OBJ_SIZE,
+                n_jobs=VALIDATION_CLIP_CPU_WORKERS if ENABLE_CPU_PARALLEL else 1,
+                batch_frames=VALIDATION_CLIP_BATCH_FRAMES,
+            )
+        else:
+            save_lightweight_validation_clips(
+                input_path,
+                out_dir=out_dir,
+                dish_center=DISH_CENTER,
+                dish_radius=DISH_RADIUS,
+                hsv_params=hsv_params,
+                sections=VALIDATION_CLIP_SECTIONS,
+                section_frames=VALIDATION_CLIP_SECTION_FRAMES,
+                output_scale=VALIDATION_CLIP_OUTPUT_SCALE,
+                stills_per_section=VALIDATION_CLIP_STILLS_PER_SECTION,
+                n_jobs=VALIDATION_CLIP_CPU_WORKERS if ENABLE_CPU_PARALLEL else 1,
+                batch_frames=VALIDATION_CLIP_BATCH_FRAMES,
+                write_video=VALIDATION_CLIP_WRITE_VIDEO,
+            )
+        print("Validation-only run completed; full analysis was skipped.")
+        raise SystemExit(0)
+
     if CLEAN_OUTPUT_DEBUG:
         clean_debug_outputs(out_dir, clean_segment_tests=True)
 
@@ -3564,16 +5243,43 @@ if __name__ == "__main__":
 
     if RUN_LIGHTWEIGHT_VALIDATION_CLIPS:
         if INPUT_MODE == "video" and SEGMENTATION_PROFILE == "hsv_circle":
-            save_lightweight_validation_clips(
-                input_path,
-                out_dir=out_dir,
-                dish_center=DISH_CENTER,
-                dish_radius=DISH_RADIUS,
-                hsv_params=hsv_params,
-                section_frames=VALIDATION_CLIP_SECTION_FRAMES,
-                output_scale=VALIDATION_CLIP_OUTPUT_SCALE,
-                stills_per_section=VALIDATION_CLIP_STILLS_PER_SECTION,
-            )
+            if USE_TEMPORAL_BODY_RECOVERY:
+                save_temporal_lightweight_validation_clips(
+                    input_path,
+                    out_dir=out_dir,
+                    dish_center=DISH_CENTER,
+                    dish_radius=DISH_RADIUS,
+                    hsv_params=hsv_params,
+                    sections=VALIDATION_CLIP_SECTIONS,
+                    section_frames=VALIDATION_CLIP_SECTION_FRAMES,
+                    output_scale=VALIDATION_CLIP_OUTPUT_SCALE,
+                    stills_per_section=VALIDATION_CLIP_STILLS_PER_SECTION,
+                    write_video=VALIDATION_CLIP_WRITE_VIDEO,
+                    skip_edge_frames=TEMPORAL_SKIP_EDGE_FRAMES,
+                    temporal_window=TEMPORAL_WINDOW,
+                    temporal_min_hits=TEMPORAL_MIN_HITS,
+                    temporal_chroma_min=TEMPORAL_CHROMA_MIN,
+                    temporal_min_channel=TEMPORAL_MIN_CHANNEL,
+                    temporal_max_value=TEMPORAL_MAX_VALUE,
+                    temporal_rim_exclusion_px=TEMPORAL_RIM_EXCLUSION_PX,
+                    temporal_connect_radius=TEMPORAL_CONNECT_RADIUS,
+                    temporal_min_obj_size=TEMPORAL_MIN_OBJ_SIZE,
+                )
+            else:
+                save_lightweight_validation_clips(
+                    input_path,
+                    out_dir=out_dir,
+                    dish_center=DISH_CENTER,
+                    dish_radius=DISH_RADIUS,
+                    hsv_params=hsv_params,
+                    sections=VALIDATION_CLIP_SECTIONS,
+                    section_frames=VALIDATION_CLIP_SECTION_FRAMES,
+                    output_scale=VALIDATION_CLIP_OUTPUT_SCALE,
+                    stills_per_section=VALIDATION_CLIP_STILLS_PER_SECTION,
+                    n_jobs=VALIDATION_CLIP_CPU_WORKERS if ENABLE_CPU_PARALLEL else 1,
+                    batch_frames=VALIDATION_CLIP_BATCH_FRAMES,
+                    write_video=VALIDATION_CLIP_WRITE_VIDEO,
+                )
         else:
             warnings.warn(
                 "Lightweight validation clips currently require video input "
@@ -3643,3 +5349,8 @@ if __name__ == "__main__":
     summary_df.to_csv(summary_csv, index=False, encoding="utf-8-sig")
     print(f"Saved summary CSV: {summary_csv}")
     print(summary_df.to_string(index=False))
+
+
+
+
+
