@@ -340,6 +340,10 @@ def apply_temporal_body_recovery_to_sequence(
     window=5,
     min_hits=4,
     connect_radius=8,
+    exterior_only=True,
+    block_hole_max_area=0,
+    final_smooth_window=1,
+    final_smooth_min_hits=None,
 ):
     """
     Add persistent pale branch pixels to ordered mask items.
@@ -356,6 +360,17 @@ def apply_temporal_body_recovery_to_sequence(
     min_hits = max(1, min(int(min_hits), window))
     half_window = window // 2
     connect_radius = max(1, int(connect_radius))
+    exterior_only = bool(exterior_only)
+    block_hole_max_area = max(0, int(block_hole_max_area or 0))
+    final_smooth_window = max(1, int(final_smooth_window or 1))
+    if final_smooth_window > 1 and final_smooth_window % 2 == 0:
+        final_smooth_window += 1
+    if final_smooth_min_hits is None:
+        final_smooth_min_hits = final_smooth_window // 2 + 1
+    final_smooth_min_hits = max(
+        1,
+        min(int(final_smooth_min_hits), final_smooth_window),
+    )
     recovered = []
     candidates = [item["candidate"].astype(bool) for item in items]
 
@@ -372,13 +387,47 @@ def apply_temporal_body_recovery_to_sequence(
             )
             trusted = keep_components_touching_mask(consensus, near_strict)
             addition = trusted & (~strict_mask)
+            if exterior_only:
+                strict_envelope = ndi.binary_fill_holes(strict_mask).astype(bool)
+                addition &= ~strict_envelope
+            elif block_hole_max_area > 0:
+                strict_envelope = ndi.binary_fill_holes(strict_mask).astype(bool)
+                internal_holes = strict_envelope & (~strict_mask)
+                hole_labels, n_holes = ndi.label(internal_holes)
+                if n_holes > 0:
+                    hole_areas = np.bincount(hole_labels.ravel())
+                    blocked_ids = np.flatnonzero(
+                        (hole_areas <= block_hole_max_area)
+                        & (np.arange(hole_areas.size) > 0)
+                    )
+                    if blocked_ids.size > 0:
+                        addition &= ~np.isin(hole_labels, blocked_ids)
 
         final_mask = keep_largest_component(strict_mask | addition)
         updated = dict(item)
+        updated["strict_mask"] = strict_mask
         updated["temporal_added_mask"] = addition & final_mask
         updated["mask"] = final_mask
         recovered.append(updated)
+
+    if final_smooth_window >= 3 and len(recovered) >= final_smooth_window:
+        smooth_half = final_smooth_window // 2
+        provisional_masks = [item["mask"].astype(bool) for item in recovered]
+        strict_masks = [item["mask"].astype(bool) for item in items]
+        for pos in range(smooth_half, len(recovered) - smooth_half):
+            local_final = provisional_masks[pos - smooth_half:pos + smooth_half + 1]
+            local_strict = strict_masks[pos - smooth_half:pos + smooth_half + 1]
+            final_hits = np.sum(np.stack(local_final, axis=0), axis=0)
+            strict_hits = np.sum(np.stack(local_strict, axis=0), axis=0)
+            stable_mask = keep_largest_component(
+                final_hits >= final_smooth_min_hits
+            )
+            stable_strict = strict_hits >= final_smooth_min_hits
+            recovered[pos]["mask"] = stable_mask
+            recovered[pos]["temporal_added_mask"] = stable_mask & (~stable_strict)
+
     return recovered
+
 def preprocess_frame(
     gray,
     bg_method="morph_open",
@@ -1123,7 +1172,7 @@ def segment_hsv_circle(
     yellow_chroma_rim_exclusion_px=8,
     yellow_chroma_connect_radius=0,
     yellow_chroma_connect_iterations=3,
-    use_relaxed_body_mask=False,
+    use_relaxed_body_mask=False,  # HSV-only: disable relaxed HSV extension
     relaxed_h_min=14,
     relaxed_h_max=55,
     relaxed_s_min=25,
@@ -2397,6 +2446,716 @@ def analyze_video_parallel_batches(
     return df, debug_data, osc
 
 
+
+
+def _safe_overlay_output_scale(output_scale):
+    """Return a safe overlay video scale in the 0.1--1.0 range."""
+    try:
+        output_scale = float(output_scale)
+    except (TypeError, ValueError):
+        warnings.warn(
+            f"Invalid output_scale={output_scale!r}; falling back to 1.0."
+        )
+        output_scale = 1.0
+    if not np.isfinite(output_scale):
+        warnings.warn(
+            f"Invalid output_scale={output_scale!r}; falling back to 1.0."
+        )
+        output_scale = 1.0
+    return float(np.clip(output_scale, 0.1, 1.0))
+
+
+
+
+def _safe_formal_frame_scale(frame_scale):
+    """Return a safe formal-analysis frame scale in the 0.1--1.0 range."""
+    try:
+        frame_scale = float(frame_scale)
+    except (TypeError, ValueError):
+        warnings.warn(
+            f"Invalid frame_scale={frame_scale!r}; falling back to 1.0."
+        )
+        frame_scale = 1.0
+    if not np.isfinite(frame_scale):
+        warnings.warn(
+            f"Invalid frame_scale={frame_scale!r}; falling back to 1.0."
+        )
+        frame_scale = 1.0
+    return float(np.clip(frame_scale, 0.1, 1.0))
+
+
+def _resize_frame_for_formal_analysis(frame, frame_scale):
+    """Resize one frame for faster formal analysis."""
+    frame_scale = _safe_formal_frame_scale(frame_scale)
+    if frame_scale >= 0.999:
+        return frame
+    h, w = frame.shape[:2]
+    out_w = max(1, int(round(w * frame_scale)))
+    out_h = max(1, int(round(h * frame_scale)))
+    return cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_AREA)
+
+
+def _scale_point_for_formal_analysis(point, frame_scale):
+    """Scale an x, y point for resized formal-analysis frames."""
+    if point is None:
+        return None
+    frame_scale = _safe_formal_frame_scale(frame_scale)
+    x, y = point
+    return (int(round(float(x) * frame_scale)), int(round(float(y) * frame_scale)))
+
+
+def _scale_radius_for_formal_analysis(radius, frame_scale):
+    """Scale a circular ROI radius for resized formal-analysis frames."""
+    if radius is None:
+        return None
+    frame_scale = _safe_formal_frame_scale(frame_scale)
+    return max(1, int(round(float(radius) * frame_scale)))
+
+
+def _scale_roi_for_formal_analysis(roi, frame_scale):
+    """Scale an x, y, w, h ROI for resized formal-analysis frames."""
+    if roi is None:
+        return None
+    frame_scale = _safe_formal_frame_scale(frame_scale)
+    x, y, w, h = roi
+    return (
+        int(round(float(x) * frame_scale)),
+        int(round(float(y) * frame_scale)),
+        max(1, int(round(float(w) * frame_scale))),
+        max(1, int(round(float(h) * frame_scale))),
+    )
+
+
+def _effective_pixel_size_for_formal_scale(pixel_size, frame_scale):
+    """
+    Keep physical/px-based units comparable after image resizing.
+
+    If the image is resized to 0.5 width and height, each processed pixel
+    represents 2 original pixels in each axis, so pixel_size is divided by 0.5.
+    With PIXEL_SIZE=1.0, area remains approximately in original px^2.
+    """
+    frame_scale = _safe_formal_frame_scale(frame_scale)
+    if pixel_size is None:
+        return pixel_size
+    return float(pixel_size) / frame_scale
+
+
+
+def _scale_radius_param_for_formal_analysis(value, frame_scale):
+    """Scale a pixel-radius parameter when formal frames are resized."""
+    if value is None:
+        return None
+    frame_scale = _safe_formal_frame_scale(frame_scale)
+    try:
+        value_float = float(value)
+    except (TypeError, ValueError):
+        return value
+    if not np.isfinite(value_float) or value_float <= 0:
+        return int(round(value_float)) if np.isfinite(value_float) else value
+    return max(1, int(round(value_float * frame_scale)))
+
+
+def _scale_area_param_for_formal_analysis(value, frame_scale):
+    """Scale a pixel-area parameter when formal frames are resized."""
+    if value is None:
+        return None
+    frame_scale = _safe_formal_frame_scale(frame_scale)
+    try:
+        value_float = float(value)
+    except (TypeError, ValueError):
+        return value
+    if not np.isfinite(value_float) or value_float <= 0:
+        return int(round(value_float)) if np.isfinite(value_float) else value
+    return max(1, int(round(value_float * frame_scale * frame_scale)))
+
+
+def _scale_hsv_params_for_formal_analysis(hsv_params, frame_scale):
+    """Scale pixel-based HSV segmentation parameters for resized formal frames."""
+    scaled = dict(hsv_params or {})
+    radius_keys = {
+        "morph_open_size",
+        "morph_close_size",
+        "yellow_chroma_rim_exclusion_px",
+        "yellow_chroma_connect_radius",
+        "relaxed_connect_radius",
+        "rim_exclusion_px",
+    }
+    area_keys = {
+        "min_obj_size",
+        "min_hole_size",
+        "body_min_hole_size",
+        "body_max_hole_size",
+        "relaxed_min_obj_size",
+    }
+    for key in radius_keys:
+        if key in scaled:
+            scaled[key] = _scale_radius_param_for_formal_analysis(scaled[key], frame_scale)
+    for key in area_keys:
+        if key in scaled:
+            scaled[key] = _scale_area_param_for_formal_analysis(scaled[key], frame_scale)
+    return scaled
+
+
+def _prepare_formal_temporal_item(
+    frame_idx,
+    frame,
+    name,
+    dish_center,
+    dish_radius,
+    hsv_params,
+    temporal_chroma_min=10,
+    temporal_min_channel=35,
+    temporal_max_value=240,
+    temporal_rim_exclusion_px=30,
+    temporal_min_obj_size=20,
+    frame_scale=1.0,
+):
+    """Segment one resized formal-analysis frame and prepare candidate pixels for temporal recovery."""
+    frame_scale = _safe_formal_frame_scale(frame_scale)
+    frame = _resize_frame_for_formal_analysis(frame, frame_scale)
+    scaled_dish_center = _scale_point_for_formal_analysis(dish_center, frame_scale)
+    scaled_dish_radius = _scale_radius_for_formal_analysis(dish_radius, frame_scale)
+    scaled_hsv_params = _scale_hsv_params_for_formal_analysis(hsv_params or {}, frame_scale)
+    enhanced, strict_mask, pre_debug = segment_hsv_circle(
+        frame,
+        dish_center=scaled_dish_center,
+        dish_radius=scaled_dish_radius,
+        **scaled_hsv_params,
+    )
+    candidate = temporal_pale_branch_candidate(
+        frame,
+        dish_center=scaled_dish_center,
+        dish_radius=scaled_dish_radius,
+        chroma_min=temporal_chroma_min,
+        min_channel=temporal_min_channel,
+        max_value=temporal_max_value,
+        rim_exclusion_px=_scale_radius_param_for_formal_analysis(temporal_rim_exclusion_px, frame_scale),
+        min_obj_size=_scale_area_param_for_formal_analysis(temporal_min_obj_size, frame_scale),
+    )
+    return {
+        "frame_idx": int(frame_idx),
+        "name": name,
+        "frame": frame,
+        "gray": _as_gray_uint8(frame),
+        "enhanced": enhanced,
+        "mask": strict_mask.astype(bool),
+        "candidate": candidate.astype(bool),
+        "pre_debug": pre_debug,
+    }
+
+
+def _build_temporal_formal_row_debug(
+    item,
+    dt,
+    pixel_size,
+    roi,
+    analysis_roi,
+    vein_params,
+    vein_every_n_frames,
+    compute_body_skeleton,
+    compute_front_speed,
+    prev_mask,
+    prev_area,
+):
+    """Build one metrics row and optional debug record from a temporal-recovered item."""
+    frame_idx = int(item["frame_idx"])
+    frame = item["frame"]
+    gray = _as_gray_uint8(frame)
+    pre_debug = item.get("pre_debug", {})
+    strict_mask = item.get("strict_mask", item.get("mask")).astype(bool)
+    temporal_mask = item["mask"].astype(bool)
+    temporal_added_mask = item.get(
+        "temporal_added_mask", np.zeros_like(temporal_mask, dtype=bool)
+    ).astype(bool)
+    candidate_mask = item.get(
+        "candidate", np.zeros_like(temporal_mask, dtype=bool)
+    ).astype(bool)
+
+    occupied_mask = temporal_mask
+    clean_mask = temporal_mask
+    envelope_mask = ndi.binary_fill_holes(temporal_mask).astype(bool)
+    body_layers = body_mask_layer_metrics(
+        occupied_mask,
+        clean_mask,
+        envelope_mask,
+        pixel_size=pixel_size,
+    )
+    body_layers["analysis_mask_type"] = "temporal_body"
+    body_layers["formal_segmentation_mask"] = "temporal_recovered_hsv_mask"
+    body_layers["use_temporal_body_recovery_formal"] = True
+    body_layers["strict_hsv_area_px"] = int(np.sum(strict_mask))
+    body_layers["strict_hsv_area"] = float(np.sum(strict_mask) * pixel_size**2)
+    body_layers["temporal_candidate_area_px"] = int(np.sum(candidate_mask))
+    body_layers["temporal_recoverable_candidate_area_px"] = int(
+        np.sum(candidate_mask & (~strict_mask))
+    )
+    body_layers["temporal_added_area_px"] = int(np.sum(temporal_added_mask))
+    body_layers["temporal_added_area"] = float(
+        np.sum(temporal_added_mask) * pixel_size**2
+    )
+    body_layers["temporal_added_fraction"] = float(
+        np.sum(temporal_added_mask) / max(np.sum(temporal_mask), 1)
+    )
+
+    focus = focus_score_laplacian(gray)
+    reg = region_metrics(temporal_mask, pixel_size=pixel_size)
+    mask_qc = mask_qc_metrics(temporal_mask, analysis_roi=analysis_roi)
+    skel = (
+        skeleton_metrics(temporal_mask, pixel_size=pixel_size)
+        if compute_body_skeleton
+        else empty_skeleton_metrics_like(temporal_mask)
+    )
+    compute_vein = vein_every_n_frames > 0 and frame_idx % int(vein_every_n_frames) == 0
+    vein = (
+        vein_network_metrics(
+            frame,
+            dish_center=pre_debug.get("dish_center"),
+            dish_radius=pre_debug.get("dish_radius"),
+            body_mask=temporal_mask,
+            pixel_size=pixel_size,
+            **(vein_params or {}),
+        )
+        if compute_vein
+        else None
+    )
+    dyn = expansion_retraction_metrics(
+        prev_mask,
+        temporal_mask,
+        dt=dt,
+        pixel_size=pixel_size,
+        compute_front_speed=compute_front_speed,
+    )
+
+    area = reg["area"]
+    if frame_idx == 0 or not np.isfinite(prev_area) or dt is None or dt <= 0:
+        dA_dt = np.nan
+    else:
+        dA_dt = float((area - prev_area) / dt)
+
+    row = {
+        "frame": frame_idx,
+        "name": item.get("name", f"frame_{frame_idx:06d}"),
+        "time": float(frame_idx * dt) if dt is not None else np.nan,
+        "focus_score": focus,
+        **reg,
+        **mask_qc,
+        **body_layers,
+        "dA_dt": dA_dt,
+        "new_area_px": dyn["new_area_px"],
+        "retracted_area_px": dyn["retracted_area_px"],
+        "explore_ratio": dyn["explore_ratio"],
+        "retreat_ratio": dyn["retreat_ratio"],
+        "net_growth_px": dyn["net_growth_px"],
+        "front_speed_mean": dyn["front_speed_mean"],
+        "front_speed_p95": dyn["front_speed_p95"],
+        "n_endpoints": skel["n_endpoints"],
+        "n_branchpoints": skel["n_branchpoints"],
+        "skeleton_length_px": skel["skeleton_length_px"],
+        "skeleton_length": skel["skeleton_length"],
+    }
+
+    if vein is not None:
+        row.update(
+            {
+                "vein_area_px": vein["vein_area_px"],
+                "vein_length_px": vein["vein_length_px"],
+                "vein_length": vein["vein_length"],
+                "vein_endpoints": vein["vein_endpoints"],
+                "vein_branchpoints": vein["vein_branchpoints"],
+            }
+        )
+
+    if roi is not None:
+        row["roi_mean_intensity"] = roi_mean_intensity(gray, roi)
+
+    debug_item = {
+        "frame": frame_idx,
+        "name": row["name"],
+        "gray": gray,
+        "background": pre_debug.get("background", np.zeros_like(gray, dtype=np.uint8)),
+        "corrected": pre_debug.get("corrected", np.zeros_like(gray, dtype=np.uint8)),
+        "enhanced": item.get("enhanced", pre_debug.get("enhanced", gray)),
+        "mask": temporal_mask,
+        "occupied_mask": occupied_mask,
+        "strict_mask": strict_mask,
+        "seed_mask": pre_debug.get("seed_mask"),
+        "temporal_candidate_mask": candidate_mask,
+        "temporal_added_mask": temporal_added_mask,
+        # Reuse the existing cyan overlay channel to make temporal additions visible.
+        "relaxed_added_mask": temporal_added_mask,
+        "envelope_mask": envelope_mask,
+        "skeleton": skel["skeleton"],
+        "endpoint_mask": skel["endpoint_mask"],
+        "branch_mask": skel["branch_mask"],
+        "vein_mask": vein["vein_mask"] if vein is not None else None,
+        "vein_skeleton": vein["vein_skeleton"] if vein is not None else None,
+        "new_region": dyn["new_region"],
+        "retracted_region": dyn["retracted_region"],
+    }
+    return row, debug_item, temporal_mask, area
+
+
+def _finalize_temporal_formal_dataframe(rows, roi, dt):
+    """Apply post-processing steps shared by formal temporal analysis paths."""
+    df = pd.DataFrame(rows)
+    df = apply_vein_confidence(df)
+    df = apply_body_mask_confidence(df)
+    df = add_body_area_derivatives(df, dt)
+    if roi is not None and "roi_mean_intensity" in df.columns:
+        osc = analyze_oscillation(df["roi_mean_intensity"].to_numpy(), dt)
+    else:
+        osc = {"dominant_freq": np.nan, "period": np.nan, "n_peaks": 0}
+    return df, osc
+
+
+def analyze_timelapse_formal_temporal(
+    frames,
+    names=None,
+    dt=30.0,
+    pixel_size=1.0,
+    roi=None,
+    analysis_roi=None,
+    dish_center=None,
+    dish_radius=None,
+    hsv_params=None,
+    vein_params=None,
+    vein_every_n_frames=1,
+    compute_body_skeleton=True,
+    compute_front_speed=True,
+    keep_debug=True,
+    temporal_window=5,
+    temporal_min_hits=4,
+    temporal_chroma_min=10,
+    temporal_min_channel=35,
+    temporal_max_value=240,
+    temporal_rim_exclusion_px=30,
+    temporal_connect_radius=8,
+    temporal_min_obj_size=20,
+    temporal_exterior_only=True,
+    temporal_block_hole_max_area=0,
+    temporal_final_smooth_window=1,
+    temporal_final_smooth_min_hits=None,
+    formal_frame_scale=1.0,
+):
+    """Formal full-frame analysis where metrics are computed from temporal-recovered masks."""
+    formal_frame_scale = _safe_formal_frame_scale(formal_frame_scale)
+    analysis_pixel_size = _effective_pixel_size_for_formal_scale(pixel_size, formal_frame_scale)
+    analysis_roi_scaled = _scale_roi_for_formal_analysis(analysis_roi, formal_frame_scale)
+    roi_scaled = _scale_roi_for_formal_analysis(roi, formal_frame_scale)
+    if formal_frame_scale < 0.999:
+        print(
+            "Formal analysis frame scaling enabled: "
+            f"scale={formal_frame_scale:.3f}. Metrics use effective pixel_size={analysis_pixel_size}."
+        )
+    temporal_connect_radius = _scale_radius_param_for_formal_analysis(
+        temporal_connect_radius, formal_frame_scale
+    )
+    temporal_block_hole_max_area = _scale_area_param_for_formal_analysis(
+        temporal_block_hole_max_area, formal_frame_scale
+    )
+    if frames is None or len(frames) == 0:
+        raise ValueError("No frames were provided for temporal formal analysis.")
+    if names is None:
+        names = [f"frame_{i:06d}" for i in range(len(frames))]
+
+    items = []
+    for i, frame in enumerate(tqdm(frames, desc="Preparing temporal formal frames")):
+        items.append(
+            _prepare_formal_temporal_item(
+                i,
+                frame,
+                names[i] if i < len(names) else f"frame_{i:06d}",
+                dish_center=dish_center,
+                dish_radius=dish_radius,
+                hsv_params=hsv_params,
+                temporal_chroma_min=temporal_chroma_min,
+                temporal_min_channel=temporal_min_channel,
+                temporal_max_value=temporal_max_value,
+                temporal_rim_exclusion_px=temporal_rim_exclusion_px,
+                temporal_min_obj_size=temporal_min_obj_size,
+                frame_scale=formal_frame_scale,
+            )
+        )
+
+    recovered = apply_temporal_body_recovery_to_sequence(
+        items,
+        window=temporal_window,
+        min_hits=temporal_min_hits,
+        connect_radius=temporal_connect_radius,
+        exterior_only=temporal_exterior_only,
+        block_hole_max_area=temporal_block_hole_max_area,
+        final_smooth_window=temporal_final_smooth_window,
+        final_smooth_min_hits=temporal_final_smooth_min_hits,
+    )
+
+    rows = []
+    debug_data = []
+    prev_mask = None
+    prev_area = np.nan
+    for item in tqdm(recovered, desc="Computing temporal formal metrics"):
+        row, debug_item, prev_mask_next, prev_area_next = _build_temporal_formal_row_debug(
+            item,
+            dt=dt,
+            pixel_size=analysis_pixel_size,
+            roi=roi_scaled,
+            analysis_roi=analysis_roi_scaled,
+            vein_params=vein_params,
+            vein_every_n_frames=vein_every_n_frames,
+            compute_body_skeleton=compute_body_skeleton,
+            compute_front_speed=compute_front_speed,
+            prev_mask=prev_mask,
+            prev_area=prev_area,
+        )
+        rows.append(row)
+        if keep_debug:
+            debug_data.append(debug_item)
+        prev_mask = prev_mask_next
+        prev_area = prev_area_next
+
+    df, osc = _finalize_temporal_formal_dataframe(rows, roi, dt)
+    return df, debug_data, osc
+
+
+def analyze_video_stream_formal_temporal(
+    video_path,
+    dt=30.0,
+    pixel_size=1.0,
+    roi=None,
+    max_frames=None,
+    debug_frame_indices=None,
+    dish_center=None,
+    dish_radius=None,
+    hsv_params=None,
+    vein_params=None,
+    vein_every_n_frames=1,
+    compute_body_skeleton=True,
+    compute_front_speed=True,
+    analysis_roi=None,
+    overlay_video_path=None,
+    overlay_video_fps=10,
+    overlay_video_output_scale=1.0,
+    temporal_window=5,
+    temporal_min_hits=4,
+    temporal_chroma_min=10,
+    temporal_min_channel=35,
+    temporal_max_value=240,
+    temporal_rim_exclusion_px=30,
+    temporal_connect_radius=8,
+    temporal_min_obj_size=20,
+    temporal_exterior_only=True,
+    temporal_block_hole_max_area=0,
+    temporal_final_smooth_window=1,
+    temporal_final_smooth_min_hits=None,
+    batch_frames=48,
+    formal_frame_scale=1.0,
+):
+    """
+    Low-memory formal analysis from a video using temporal-recovered masks.
+
+    Frames are processed in core chunks with temporal halo frames around each
+    chunk, so the symmetric temporal window can be used without loading the
+    entire movie into memory.
+    """
+    video_path = Path(video_path)
+    if not video_path.exists():
+        raise FileNotFoundError(f"Input video does not exist: {video_path}")
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise ValueError(f"Could not open video: {video_path}")
+
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if max_frames is not None:
+        total_to_process = min(total, int(max_frames)) if total > 0 else int(max_frames)
+    else:
+        total_to_process = total
+    if total_to_process <= 0:
+        cap.release()
+        raise ValueError(f"No frames could be read from video: {video_path}")
+
+    temporal_window = max(3, int(temporal_window or 3))
+    if temporal_window % 2 == 0:
+        temporal_window += 1
+    temporal_min_hits = max(1, min(int(temporal_min_hits), temporal_window))
+    temporal_final_smooth_window = max(1, int(temporal_final_smooth_window or 1))
+    if temporal_final_smooth_window > 1 and temporal_final_smooth_window % 2 == 0:
+        temporal_final_smooth_window += 1
+    if temporal_final_smooth_min_hits is None:
+        temporal_final_smooth_min_hits = temporal_final_smooth_window // 2 + 1
+    temporal_final_smooth_min_hits = max(
+        1,
+        min(int(temporal_final_smooth_min_hits), temporal_final_smooth_window),
+    )
+    temporal_halo = max(temporal_window // 2, temporal_final_smooth_window // 2)
+    batch_frames = max(1, int(batch_frames or 1))
+    debug_frame_indices = set(debug_frame_indices or [])
+    overlay_video_output_scale = _safe_overlay_output_scale(overlay_video_output_scale)
+    formal_frame_scale = _safe_formal_frame_scale(formal_frame_scale)
+    analysis_pixel_size = _effective_pixel_size_for_formal_scale(pixel_size, formal_frame_scale)
+    analysis_roi_scaled = _scale_roi_for_formal_analysis(analysis_roi, formal_frame_scale)
+    roi_scaled = _scale_roi_for_formal_analysis(roi, formal_frame_scale)
+    # Frames are already resized before analysis. Avoid double-shrinking overlay output.
+    if formal_frame_scale < 0.999:
+        overlay_video_output_scale = 1.0
+        print(
+            "Formal analysis frame scaling enabled: "
+            f"scale={formal_frame_scale:.3f}. Metrics use effective pixel_size={analysis_pixel_size}. "
+            "Formal overlay is written at the same processed resolution."
+        )
+    temporal_connect_radius = _scale_radius_param_for_formal_analysis(
+        temporal_connect_radius, formal_frame_scale
+    )
+    temporal_block_hole_max_area = _scale_area_param_for_formal_analysis(
+        temporal_block_hole_max_area, formal_frame_scale
+    )
+
+    writer = None
+    writer_size = None
+    if overlay_video_path is not None:
+        overlay_video_path = Path(overlay_video_path)
+        overlay_video_path.parent.mkdir(parents=True, exist_ok=True)
+
+    rows = []
+    debug_data = []
+    prev_mask = None
+    prev_area = np.nan
+    core_start = 0
+
+    print(
+        "Formal temporal recovery enabled: metrics, summary, and formal overlay "
+        "will use the temporal-recovered mask."
+    )
+
+    try:
+        with tqdm(total=total_to_process, desc="Analyzing video with formal temporal recovery") as pbar:
+            while core_start < total_to_process:
+                core_end = min(total_to_process - 1, core_start + batch_frames - 1)
+                read_start = max(0, core_start - temporal_halo)
+                read_end = min(total_to_process - 1, core_end + temporal_halo)
+
+                cap.set(cv2.CAP_PROP_POS_FRAMES, read_start)
+                items = []
+                for frame_idx in range(read_start, read_end + 1):
+                    ok, frame_bgr = cap.read()
+                    if not ok:
+                        break
+                    items.append(
+                        _prepare_formal_temporal_item(
+                            frame_idx,
+                            frame_bgr,
+                            f"frame_{frame_idx:06d}",
+                            dish_center=dish_center,
+                            dish_radius=dish_radius,
+                            hsv_params=hsv_params,
+                            temporal_chroma_min=temporal_chroma_min,
+                            temporal_min_channel=temporal_min_channel,
+                            temporal_max_value=temporal_max_value,
+                            temporal_rim_exclusion_px=temporal_rim_exclusion_px,
+                            temporal_min_obj_size=temporal_min_obj_size,
+                            frame_scale=formal_frame_scale,
+                        )
+                    )
+
+                if not items:
+                    break
+
+                recovered = apply_temporal_body_recovery_to_sequence(
+                    items,
+                    window=temporal_window,
+                    min_hits=temporal_min_hits,
+                    connect_radius=temporal_connect_radius,
+                    exterior_only=temporal_exterior_only,
+                    block_hole_max_area=temporal_block_hole_max_area,
+                    final_smooth_window=temporal_final_smooth_window,
+                    final_smooth_min_hits=temporal_final_smooth_min_hits,
+                )
+
+                core_items = [
+                    item for item in recovered
+                    if core_start <= int(item["frame_idx"]) <= core_end
+                ]
+                for item in core_items:
+                    row, debug_item, prev_mask_next, prev_area_next = _build_temporal_formal_row_debug(
+                        item,
+                        dt=dt,
+                        pixel_size=analysis_pixel_size,
+                        roi=roi_scaled,
+                        analysis_roi=analysis_roi_scaled,
+                        vein_params=vein_params,
+                        vein_every_n_frames=vein_every_n_frames,
+                        compute_body_skeleton=compute_body_skeleton,
+                        compute_front_speed=compute_front_speed,
+                        prev_mask=prev_mask,
+                        prev_area=prev_area,
+                    )
+                    frame_idx = int(item["frame_idx"])
+                    rows.append(row)
+
+                    if frame_idx in debug_frame_indices:
+                        debug_data.append(debug_item)
+
+                    if overlay_video_path is not None:
+                        overlay_rgb = overlay_mask_skeleton(
+                            debug_item["gray"],
+                            mask=debug_item["mask"],
+                            skeleton=debug_item["skeleton"],
+                            endpoint_mask=debug_item["endpoint_mask"],
+                            branch_mask=debug_item["branch_mask"],
+                            vein_mask=debug_item.get("vein_mask"),
+                            vein_skeleton=debug_item.get("vein_skeleton"),
+                            relaxed_added_mask=debug_item.get("temporal_added_mask"),
+                            new_region=debug_item["new_region"],
+                            retracted_region=debug_item["retracted_region"],
+                        )
+                        overlay_bgr = cv2.cvtColor(overlay_rgb, cv2.COLOR_RGB2BGR)
+                        if writer is None:
+                            height, width = overlay_bgr.shape[:2]
+                            out_width = max(1, int(round(width * overlay_video_output_scale)))
+                            out_height = max(1, int(round(height * overlay_video_output_scale)))
+                            writer_size = (out_width, out_height)
+                            writer = cv2.VideoWriter(
+                                str(overlay_video_path),
+                                cv2.VideoWriter_fourcc(*"mp4v"),
+                                float(overlay_video_fps),
+                                writer_size,
+                                True,
+                            )
+                            if not writer.isOpened():
+                                raise ValueError(
+                                    f"Could not open video writer for: {overlay_video_path}"
+                                )
+                            print(
+                                "Writing formal temporal overlay video "
+                                f"at scale {overlay_video_output_scale:.3f}: "
+                                f"{width}x{height} -> {out_width}x{out_height}"
+                            )
+                        if writer_size is not None and overlay_bgr.shape[1::-1] != writer_size:
+                            overlay_bgr = cv2.resize(
+                                overlay_bgr,
+                                writer_size,
+                                interpolation=cv2.INTER_AREA,
+                            )
+                        writer.write(overlay_bgr)
+
+                    prev_mask = prev_mask_next
+                    prev_area = prev_area_next
+
+                processed = len(core_items)
+                pbar.update(processed)
+                core_start = core_end + 1
+                del items, recovered, core_items
+                gc.collect()
+    finally:
+        cap.release()
+        if writer is not None:
+            writer.release()
+
+    if not rows:
+        raise ValueError(f"No frames could be read from video: {video_path}")
+
+    df, osc = _finalize_temporal_formal_dataframe(rows, roi, dt)
+    return df, debug_data, osc
+
 def plot_summary(df, out_prefix=None):
     """
     Plot and optionally save summary time-series:
@@ -2634,6 +3393,21 @@ def save_debug_examples(
                 str(out_dir / f"{stem}_relaxed_added_mask.png"),
                 item["relaxed_added_mask"].astype(np.uint8) * 255,
             )
+        if item.get("temporal_added_mask") is not None:
+            cv2.imwrite(
+                str(out_dir / f"{stem}_temporal_added_mask.png"),
+                item["temporal_added_mask"].astype(np.uint8) * 255,
+            )
+        if item.get("temporal_candidate_mask") is not None:
+            cv2.imwrite(
+                str(out_dir / f"{stem}_temporal_candidate_mask.png"),
+                item["temporal_candidate_mask"].astype(np.uint8) * 255,
+            )
+        if item.get("strict_mask") is not None:
+            cv2.imwrite(
+                str(out_dir / f"{stem}_strict_hsv_mask.png"),
+                item["strict_mask"].astype(np.uint8) * 255,
+            )
         if "envelope_mask" in item:
             cv2.imwrite(
                 str(out_dir / f"{stem}_envelope_mask.png"),
@@ -2661,12 +3435,24 @@ def clean_debug_outputs(out_dir, clean_segment_tests=False):
         path.mkdir(parents=True, exist_ok=True)
 
 
-def save_overlay_video(debug_data, out_path, fps=10, draw_frame_text=True):
+def save_overlay_video(
+    debug_data,
+    out_path,
+    fps=10,
+    draw_frame_text=True,
+    output_scale=1.0,
+):
     """
     Save an overlay video from debug_data.
 
     The fps here is only for playback speed of the exported overlay video.
     It does not change biological time calculations, which use FRAME_INTERVAL.
+
+    output_scale controls the exported video resolution:
+    - 1.0 = original frame size
+    - 0.5 = half width and half height
+    - 0.25 = quarter width and quarter height
+    Values are clipped to 0.1--1.0 to avoid accidental huge or invalid videos.
     """
     if debug_data is None or len(debug_data) == 0:
         warnings.warn("No debug_data available to save overlay video.")
@@ -2677,11 +3463,39 @@ def save_overlay_video(debug_data, out_path, fps=10, draw_frame_text=True):
 
     first_gray = _as_gray_uint8(debug_data[0]["gray"])
     height, width = first_gray.shape[:2]
+    try:
+        output_scale = float(output_scale)
+    except (TypeError, ValueError):
+        warnings.warn(
+            f"Invalid output_scale={output_scale!r}; falling back to 1.0."
+        )
+        output_scale = 1.0
+    if not np.isfinite(output_scale):
+        warnings.warn(
+            f"Invalid output_scale={output_scale!r}; falling back to 1.0."
+        )
+        output_scale = 1.0
+    output_scale = float(np.clip(output_scale, 0.1, 1.0))
+    out_width = max(1, int(round(width * output_scale)))
+    out_height = max(1, int(round(height * output_scale)))
+
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(out_path), fourcc, float(fps), (width, height), True)
+    writer = cv2.VideoWriter(
+        str(out_path),
+        fourcc,
+        float(fps),
+        (out_width, out_height),
+        True,
+    )
 
     if not writer.isOpened():
         raise ValueError(f"Could not open video writer for: {out_path}")
+
+    print(
+        "Writing overlay video "
+        f"at scale {output_scale:.3f}: "
+        f"{width}x{height} -> {out_width}x{out_height}"
+    )
 
     try:
         for item in tqdm(debug_data, desc="Writing overlay video"):
@@ -2699,26 +3513,40 @@ def save_overlay_video(debug_data, out_path, fps=10, draw_frame_text=True):
             )
             frame_bgr = cv2.cvtColor(overlay_rgb, cv2.COLOR_RGB2BGR)
 
+            if (out_width, out_height) != (width, height):
+                frame_bgr = cv2.resize(
+                    frame_bgr,
+                    (out_width, out_height),
+                    interpolation=cv2.INTER_AREA,
+                )
+
             if draw_frame_text:
                 text = f"frame {int(item['frame'])}"
+                text_origin = (
+                    max(10, int(round(30 * output_scale))),
+                    max(20, int(round(50 * output_scale))),
+                )
+                font_scale = max(0.4, 1.2 * output_scale)
+                outer_thickness = max(2, int(round(3 * output_scale)))
+                inner_thickness = max(1, int(round(1 * output_scale)))
                 cv2.putText(
                     frame_bgr,
                     text,
-                    (30, 50),
+                    text_origin,
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    1.2,
+                    font_scale,
                     (255, 255, 255),
-                    3,
+                    outer_thickness,
                     cv2.LINE_AA,
                 )
                 cv2.putText(
                     frame_bgr,
                     text,
-                    (30, 50),
+                    text_origin,
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    1.2,
+                    font_scale,
                     (0, 0, 0),
-                    1,
+                    inner_thickness,
                     cv2.LINE_AA,
                 )
 
@@ -3933,7 +4761,6 @@ def _render_lightweight_validation_frame_for_parallel(args):
     clean_mask = clean_mask.astype(bool)
     envelope_mask = mask_debug["envelope_mask"].astype(bool)
     filled_small_holes = clean_mask & (~occupied_mask)
-    remaining_envelope_holes = envelope_mask & (~clean_mask)
 
     overlay = frame.copy().astype(np.float32)
 
@@ -4027,14 +4854,9 @@ def _render_temporal_validation_overlay(
 ):
     overlay = frame.copy().astype(np.float32)
     mask = mask.astype(bool)
-    temporal_added_mask = temporal_added_mask.astype(bool)
     if np.any(mask):
         overlay[mask] = (1.0 - float(overlay_alpha)) * overlay[mask] + float(overlay_alpha) * np.array(
             [0, 255, 0], dtype=np.float32
-        )
-    if np.any(temporal_added_mask):
-        overlay[temporal_added_mask] = 0.25 * overlay[temporal_added_mask] + 0.75 * np.array(
-            [255, 255, 0], dtype=np.float32
         )
     overlay = np.clip(overlay, 0, 255).astype(np.uint8)
     contours, _ = cv2.findContours(
@@ -4053,7 +4875,7 @@ def _render_temporal_validation_overlay(
     )
     cv2.putText(
         overlay,
-        "green=body, cyan=temporal-added, red=outer boundary",
+        "green=body (strict+temporal), red=outer boundary",
         (30, 100),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.9,
@@ -4106,6 +4928,7 @@ def _prepare_temporal_validation_frame_for_parallel(args):
         "mask": mask.astype(bool),
         "candidate": candidate.astype(bool),
     }
+
 def save_temporal_lightweight_validation_clips(
     video_path,
     out_dir,
@@ -4127,6 +4950,10 @@ def save_temporal_lightweight_validation_clips(
     temporal_rim_exclusion_px=30,
     temporal_connect_radius=8,
     temporal_min_obj_size=20,
+    temporal_exterior_only=True,
+    temporal_block_hole_max_area=0,
+    temporal_final_smooth_window=1,
+    temporal_final_smooth_min_hits=None,
     n_jobs=1,
     batch_frames=32,
 ):
@@ -4144,6 +4971,23 @@ def save_temporal_lightweight_validation_clips(
         raise ValueError(f"Video frame count is unavailable: {video_path}")
 
     output_scale = float(np.clip(output_scale, 0.1, 1.0))
+    temporal_window = max(3, int(temporal_window or 3))
+    if temporal_window % 2 == 0:
+        temporal_window += 1
+    temporal_min_hits = max(1, min(int(temporal_min_hits), temporal_window))
+    temporal_final_smooth_window = max(1, int(temporal_final_smooth_window or 1))
+    if temporal_final_smooth_window > 1 and temporal_final_smooth_window % 2 == 0:
+        temporal_final_smooth_window += 1
+    if temporal_final_smooth_min_hits is None:
+        temporal_final_smooth_min_hits = temporal_final_smooth_window // 2 + 1
+    temporal_final_smooth_min_hits = max(
+        1,
+        min(int(temporal_final_smooth_min_hits), temporal_final_smooth_window),
+    )
+    scaled_block_hole_max_area = max(
+        0,
+        int(round(float(temporal_block_hole_max_area or 0) * output_scale ** 2)),
+    )
     skip_edge_frames = max(0, int(skip_edge_frames or 0))
     usable_start = min(skip_edge_frames, max(0, total_frames - 1))
     usable_end = max(usable_start, total_frames - skip_edge_frames - 1)
@@ -4210,37 +5054,55 @@ def save_temporal_lightweight_validation_clips(
             ).tolist()
         )
 
+        temporal_halo = temporal_window // 2 + temporal_final_smooth_window // 2
+        clip_path = section_dir / f"{label}_color_mask_overlay.mp4"
+        writer = None
+        candidate_areas = []
+        recoverable_candidate_areas = []
+        added_areas = []
+        added_fractions = []
+        processed_count = 0
+        peak_prepared_frames = 0
+
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
             raise ValueError(f"Could not reopen video: {video_path}")
-        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-        items = []
         executor = ProcessPoolExecutor(max_workers=n_jobs) if n_jobs > 1 else None
         try:
             with tqdm(
                 total=end_frame - start_frame + 1,
                 desc=(
-                    f"Preparing temporal {label} validation with {n_jobs} CPU workers"
-                    if n_jobs > 1 else f"Preparing temporal {label} validation"
+                    f"Streaming temporal {label} validation with {n_jobs} CPU workers"
+                    if n_jobs > 1 else f"Streaming temporal {label} validation"
                 ),
             ) as pbar:
-                next_frame = start_frame
-                while next_frame <= end_frame:
+                core_start = start_frame
+                while core_start <= end_frame:
+                    core_end = min(end_frame, core_start + batch_frames - 1)
+                    read_start = max(start_frame, core_start - temporal_halo)
+                    read_end = min(end_frame, core_end + temporal_halo)
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, read_start)
+
                     work_items = []
-                    while len(work_items) < batch_frames and next_frame <= end_frame:
+                    for frame_idx in range(read_start, read_end + 1):
                         ok, frame = cap.read()
                         if not ok:
-                            break
-                        frame_small = cv2.resize(
-                            frame,
-                            None,
-                            fx=output_scale,
-                            fy=output_scale,
-                            interpolation=cv2.INTER_AREA,
-                        )
+                            raise ValueError(
+                                f"Could not read validation frame {frame_idx} from {video_path}"
+                            )
+                        if output_scale == 1.0:
+                            frame_small = frame
+                        else:
+                            frame_small = cv2.resize(
+                                frame,
+                                None,
+                                fx=output_scale,
+                                fy=output_scale,
+                                interpolation=cv2.INTER_AREA,
+                            )
                         work_items.append(
                             (
-                                next_frame,
+                                frame_idx,
                                 frame_small,
                                 scaled_center,
                                 scaled_radius,
@@ -4252,78 +5114,168 @@ def save_temporal_lightweight_validation_clips(
                                 scaled_temporal_min_obj,
                             )
                         )
-                        next_frame += 1
-
-                    if not work_items:
-                        break
 
                     if executor is not None:
-                        prepared = list(executor.map(_prepare_temporal_validation_frame_for_parallel, work_items))
+                        prepared = list(
+                            executor.map(
+                                _prepare_temporal_validation_frame_for_parallel,
+                                work_items,
+                            )
+                        )
                     else:
-                        prepared = [_prepare_temporal_validation_frame_for_parallel(item) for item in work_items]
+                        prepared = [
+                            _prepare_temporal_validation_frame_for_parallel(item)
+                            for item in work_items
+                        ]
                     prepared.sort(key=lambda item: item["frame_idx"])
-                    items.extend(prepared)
-                    pbar.update(len(prepared))
-                    del work_items, prepared
+                    peak_prepared_frames = max(peak_prepared_frames, len(prepared))
+                    recovered = apply_temporal_body_recovery_to_sequence(
+                        prepared,
+                        window=temporal_window,
+                        min_hits=temporal_min_hits,
+                        connect_radius=scaled_temporal_connect,
+                        exterior_only=temporal_exterior_only,
+                        block_hole_max_area=scaled_block_hole_max_area,
+                        final_smooth_window=temporal_final_smooth_window,
+                        final_smooth_min_hits=temporal_final_smooth_min_hits,
+                    )
+                    core_items = [
+                        item
+                        for item in recovered
+                        if core_start <= int(item["frame_idx"]) <= core_end
+                    ]
+                    if len(core_items) != core_end - core_start + 1:
+                        raise RuntimeError(
+                            f"Temporal batch returned {len(core_items)} core frames; "
+                            f"expected {core_end - core_start + 1}."
+                        )
+
+                    for item in core_items:
+                        frame_idx = int(item["frame_idx"])
+                        mask = item["mask"].astype(bool)
+                        strict_mask = item.get("strict_mask", item["mask"]).astype(bool)
+                        candidate = item["candidate"].astype(bool)
+                        addition = item.get(
+                            "temporal_added_mask",
+                            np.zeros_like(mask, dtype=bool),
+                        ).astype(bool)
+                        candidate_area = int(candidate.sum())
+                        recoverable_candidate_area = int((candidate & (~strict_mask)).sum())
+                        added_area = int(addition.sum())
+                        candidate_areas.append(candidate_area)
+                        recoverable_candidate_areas.append(recoverable_candidate_area)
+                        added_areas.append(added_area)
+                        if np.any(mask):
+                            added_fractions.append(float(added_area / mask.sum()))
+                        else:
+                            added_fractions.append(0.0)
+                        overlay = _render_temporal_validation_overlay(
+                            item["frame"],
+                            mask,
+                            addition,
+                            label,
+                            frame_idx,
+                            total_frames,
+                            overlay_alpha,
+                        )
+                        if write_video:
+                            if writer is None:
+                                height, width = overlay.shape[:2]
+                                writer = cv2.VideoWriter(
+                                    str(clip_path),
+                                    cv2.VideoWriter_fourcc(*"mp4v"),
+                                    source_fps if source_fps > 0 else 30.0,
+                                    (width, height),
+                                    True,
+                                )
+                                if not writer.isOpened():
+                                    raise ValueError(
+                                        f"Could not open validation writer: {clip_path}"
+                                    )
+                            writer.write(overlay)
+
+                        if frame_idx in still_frames:
+                            cv2.imwrite(
+                                str(still_dir / f"frame_{frame_idx:06d}_original.jpg"),
+                                item["frame"],
+                                [cv2.IMWRITE_JPEG_QUALITY, 92],
+                            )
+                            cv2.imwrite(
+                                str(still_dir / f"frame_{frame_idx:06d}_overlay.jpg"),
+                                overlay,
+                                [cv2.IMWRITE_JPEG_QUALITY, 92],
+                            )
+                            cv2.imwrite(
+                                str(still_dir / f"frame_{frame_idx:06d}_strict_occupied_mask.png"),
+                                strict_mask.astype(np.uint8) * 255,
+                            )
+                            cv2.imwrite(
+                                str(still_dir / f"frame_{frame_idx:06d}_temporal_candidate_mask.png"),
+                                candidate.astype(np.uint8) * 255,
+                            )
+                            cv2.imwrite(
+                                str(still_dir / f"frame_{frame_idx:06d}_temporal_added_mask.png"),
+                                addition.astype(np.uint8) * 255,
+                            )
+                            cv2.imwrite(
+                                str(still_dir / f"frame_{frame_idx:06d}_occupied_temporal_mask.png"),
+                                mask.astype(np.uint8) * 255,
+                            )
+
+                    processed_count += len(core_items)
+                    pbar.update(len(core_items))
+                    core_start = core_end + 1
+                    del work_items, prepared, recovered, core_items
                     gc.collect()
         finally:
             cap.release()
             if executor is not None:
                 executor.shutdown(wait=True)
-
-        recovered = apply_temporal_body_recovery_to_sequence(
-            items,
-            window=temporal_window,
-            min_hits=temporal_min_hits,
-            connect_radius=scaled_temporal_connect,
-        )
-        clip_path = section_dir / f"{label}_color_mask_overlay.mp4"
-        writer = None
-        added_fractions = []
-        try:
-            for item in tqdm(recovered, desc=f"Saving temporal {label} validation"):
-                frame_idx = int(item["frame_idx"])
-                mask = item["mask"].astype(bool)
-                addition = item.get("temporal_added_mask", np.zeros_like(mask, dtype=bool)).astype(bool)
-                if np.any(mask):
-                    added_fractions.append(float(addition.sum() / mask.sum()))
-                overlay = _render_temporal_validation_overlay(
-                    item["frame"],
-                    mask,
-                    addition,
-                    label,
-                    frame_idx,
-                    total_frames,
-                    overlay_alpha,
-                )
-                if write_video:
-                    if writer is None:
-                        height, width = overlay.shape[:2]
-                        writer = cv2.VideoWriter(
-                            str(clip_path),
-                            cv2.VideoWriter_fourcc(*"mp4v"),
-                            source_fps if source_fps > 0 else 30.0,
-                            (width, height),
-                            True,
-                        )
-                        if not writer.isOpened():
-                            raise ValueError(f"Could not open validation writer: {clip_path}")
-                    writer.write(overlay)
-
-                if frame_idx in still_frames:
-                    cv2.imwrite(
-                        str(still_dir / f"frame_{frame_idx:06d}_original.jpg"),
-                        item["frame"],
-                        [cv2.IMWRITE_JPEG_QUALITY, 92],
-                    )
-                    cv2.imwrite(
-                        str(still_dir / f"frame_{frame_idx:06d}_overlay.jpg"),
-                        overlay,
-                        [cv2.IMWRITE_JPEG_QUALITY, 92],
-                    )
-        finally:
             if writer is not None:
                 writer.release()
+
+        candidate_area_px_mean = (
+            float(np.mean(candidate_areas)) if candidate_areas else 0.0
+        )
+        recoverable_candidate_area_px_mean = (
+            float(np.mean(recoverable_candidate_areas))
+            if recoverable_candidate_areas else 0.0
+        )
+        added_area_px_mean = float(np.mean(added_areas)) if added_areas else 0.0
+        added_fraction_mean = (
+            float(np.mean(added_fractions)) if added_fractions else 0.0
+        )
+        added_fraction_p95 = (
+            float(np.percentile(added_fractions, 95)) if added_fractions else 0.0
+        )
+        frames_with_added = int(np.count_nonzero(np.asarray(added_areas) > 0))
+        print(f"[{label}] temporal_candidate_area_px_mean = {candidate_area_px_mean:.2f}")
+        print(f"[{label}] temporal_added_area_px_mean = {added_area_px_mean:.2f}")
+        print(f"[{label}] temporal_added_fraction_mean = {added_fraction_mean:.6f}")
+        print(f"[{label}] temporal_added_fraction_p95 = {added_fraction_p95:.6f}")
+        print(
+            f"[{label}] number_of_frames_with_temporal_added_area_px > 0 = "
+            f"{frames_with_added}"
+        )
+
+        candidate_low_threshold = max(
+            float(scaled_temporal_min_obj * 5),
+            float(np.pi * scaled_radius ** 2 * 0.001),
+        )
+        if candidate_area_px_mean < candidate_low_threshold:
+            warnings.warn(
+                "Temporal candidate is too strict; consider lowering "
+                "TEMPORAL_CHROMA_MIN or TEMPORAL_MIN_CHANNEL."
+            )
+        elif (
+            recoverable_candidate_area_px_mean >= candidate_low_threshold
+            and added_area_px_mean
+            < max(1.0, recoverable_candidate_area_px_mean * 0.05)
+        ):
+            warnings.warn(
+                "Temporal consensus/connectivity is too strict; consider lowering "
+                "TEMPORAL_MIN_HITS or increasing TEMPORAL_CONNECT_RADIUS."
+            )
 
         summary_rows.append(
             {
@@ -4331,7 +5283,7 @@ def save_temporal_lightweight_validation_clips(
                 "video_total_frames": total_frames,
                 "start_frame": start_frame,
                 "end_frame": end_frame,
-                "processed_frames": len(recovered),
+                "processed_frames": processed_count,
                 "output_scale": output_scale,
                 "write_video": write_video,
                 "temporal_window": temporal_window,
@@ -4339,21 +5291,36 @@ def save_temporal_lightweight_validation_clips(
                 "temporal_chroma_min": temporal_chroma_min,
                 "temporal_rim_exclusion_px": temporal_rim_exclusion_px,
                 "temporal_connect_radius": temporal_connect_radius,
-                "mean_temporal_added_fraction": float(np.nanmean(added_fractions)) if added_fractions else np.nan,
+                "temporal_exterior_only": bool(temporal_exterior_only),
+                "temporal_block_hole_max_area": int(temporal_block_hole_max_area),
+                "temporal_final_smooth_window": int(temporal_final_smooth_window),
+                "temporal_final_smooth_min_hits": int(temporal_final_smooth_min_hits),
+                "temporal_halo_frames": int(temporal_halo),
+                "peak_prepared_frames": int(peak_prepared_frames),
+                "temporal_candidate_area_px_mean": candidate_area_px_mean,
+                "temporal_recoverable_candidate_area_px_mean": (
+                    recoverable_candidate_area_px_mean
+                ),
+                "temporal_added_area_px_mean": added_area_px_mean,
+                "temporal_added_fraction_mean": added_fraction_mean,
+                "temporal_added_fraction_p95": added_fraction_p95,
+                "frames_with_temporal_added_area_px_gt_0": frames_with_added,
+                "mean_temporal_added_fraction": (
+                    float(np.nanmean(added_fractions))
+                    if added_fractions else np.nan
+                ),
                 "clip_path": str(clip_path) if write_video else "not_written",
                 "stills_path": str(still_dir),
             }
         )
-
-        del items, recovered
         gc.collect()
-
     summary_df = pd.DataFrame(summary_rows)
     summary_csv = validation_dir / "validation_clips_summary.csv"
     summary_df.to_csv(summary_csv, index=False, encoding="utf-8-sig")
     print(f"Saved temporal validation clips: {validation_dir}")
     print(f"Saved validation summary: {summary_csv}")
     return summary_df
+
 def save_lightweight_validation_clips(
     video_path,
     out_dir,
@@ -4866,7 +5833,59 @@ if __name__ == "__main__":
     INPUT_MODE = "video"  # "folder" or "video"
     INPUT_PATH = r"C:\Users\chen8\Pictures\研究\實驗圖\年菌\output2.mp4"
     OUTPUT_DIR = r"results_plasmodium"
-    OVERLAY_VALIDATION_MODE = True
+
+    # ============================================================
+    # Run mode selector
+    # ============================================================
+    # Choose one mode before running:
+    #
+    # "formal"
+    #     Run the normal full HSV analysis and save formal metrics/summary/overlay.
+    #
+    # "test_front_middle_rear"
+    #     Only export lightweight validation clips/stills from front, middle,
+    #     and rear sections. Full formal analysis is skipped.
+    #     If USE_TEMPORAL_BODY_RECOVERY is True, these clips use temporal recovery.
+    #
+    # "test_rear"
+    #     Only export the rear lightweight validation clip/stills.
+    #     Full formal analysis is skipped.
+    #     If USE_TEMPORAL_BODY_RECOVERY is True, these clips use temporal recovery.
+    #
+    # "formal_plus_front_middle_rear_test"
+    #     Run full formal HSV analysis first, then export front/middle/rear
+    #     lightweight validation clips/stills.
+    RUN_MODE = "test_front_middle_rear"
+
+    VALID_RUN_MODES = {
+        "formal",
+        "test_front_middle_rear",
+        "test_rear",
+        "formal_plus_front_middle_rear_test",
+    }
+    if RUN_MODE not in VALID_RUN_MODES:
+        raise ValueError(
+            f"RUN_MODE must be one of {sorted(VALID_RUN_MODES)}, got {RUN_MODE!r}"
+        )
+
+    RUN_FORMAL_ANALYSIS = RUN_MODE in {
+        "formal",
+        "formal_plus_front_middle_rear_test",
+    }
+    RUN_TEST_CLIPS = RUN_MODE in {
+        "test_front_middle_rear",
+        "test_rear",
+        "formal_plus_front_middle_rear_test",
+    }
+    TEST_ONLY_MODE = RUN_MODE in {"test_front_middle_rear", "test_rear"}
+    if RUN_MODE == "test_rear":
+        SELECTED_VALIDATION_SECTIONS = ("rear",)
+    else:
+        SELECTED_VALIDATION_SECTIONS = ("front", "middle", "rear")
+
+    # ============================================================
+    # Basic processing settings
+    # ============================================================
     CLEAN_OUTPUT_DEBUG = True
     ENABLE_CPU_PARALLEL = True
     CPU_WORKERS = 8
@@ -4874,64 +5893,88 @@ if __name__ == "__main__":
     PARALLEL_BATCH_FRAMES = 32
 
     # Use the real acquisition interval, not the exported video playback FPS.
-    # Example: images captured every 10 s and exported as 60 FPS video still use 10.0 here.
+    # Example: images captured every 10 s and exported as 30 FPS video still use 10.0 here.
     FRAME_INTERVAL = 10.0
     PIXEL_SIZE = 1.0
     ROI = None  # Example: ROI = (x, y, w, h)
     SEGMENTATION_PROFILE = "hsv_circle"  # "hsv_circle", "classic", or "grabcut_blob"
     ANALYSIS_ROI = (700, 520, 850, 700)  # Used only by "classic" / "grabcut_blob".
-    DISH_CENTER = (1280, 960)  # x, y. Adjust once per camera setup if needed.
-    DISH_RADIUS = 750
+    DISH_CENTER = (1280, 920)  # x, y. Adjust once per camera setup if needed.
+    DISH_RADIUS = 680
+
+    # Formal analysis time window. Use the same cutoff for microgravity and 1g.
+    # None = analyze the whole video. Example: 40000 s / 10 s = 4000 frames.
+    FORMAL_ANALYSIS_MAX_TIME_SEC = None
+    if FORMAL_ANALYSIS_MAX_TIME_SEC is None:
+        FORMAL_ANALYSIS_MAX_FRAMES = None
+    else:
+        FORMAL_ANALYSIS_MAX_FRAMES = int(
+            round(float(FORMAL_ANALYSIS_MAX_TIME_SEC) / float(FRAME_INTERVAL))
+        )
+
     MANUAL_MASK_DIR = None  # Optional folder with hand-labeled masks for IoU/Dice validation.
     SEGMENT_TEST_FRAMES_PER_PART = 3
     RUN_RELIABILITY_VALIDATION = False
     RELIABILITY_SAMPLE_COUNT = 5
     RELIABILITY_TOP_AREA_JUMPS = 8
     RELIABILITY_VALIDATE_VEINS = True
-    RUN_LIGHTWEIGHT_VALIDATION_CLIPS = True
-    VALIDATION_ONLY_MODE = True
-    VALIDATION_CLIP_SECTIONS = ("front", "middle", "rear")
-    #VALIDATION_CLIP_SECTIONS = ("front", "rear")
-    #VALIDATION_CLIP_SECTIONS = ("rear")
+
+    # Validation clip settings. These are controlled by RUN_MODE.
+    RUN_LIGHTWEIGHT_VALIDATION_CLIPS = RUN_TEST_CLIPS
+    VALIDATION_ONLY_MODE = TEST_ONLY_MODE
+    VALIDATION_CLIP_SECTIONS = SELECTED_VALIDATION_SECTIONS
     VALIDATION_CLIP_SECTION_FRAMES = 300
     VALIDATION_CLIP_OUTPUT_SCALE = 0.5
     VALIDATION_CLIP_STILLS_PER_SECTION = 6
     VALIDATION_CLIP_CPU_WORKERS = CPU_WORKERS
     VALIDATION_CLIP_BATCH_FRAMES = 48
     VALIDATION_CLIP_WRITE_VIDEO = True
+
+    # Temporal recovery can be used in both validation clips and formal metrics.
+    # When RUN_FORMAL_ANALYSIS is True and USE_TEMPORAL_BODY_RECOVERY is True,
+    # formal CSV, summary plot, debug examples, and overlay use temporal masks.
     USE_TEMPORAL_BODY_RECOVERY = True
+    FORMAL_USE_TEMPORAL_BODY_RECOVERY = bool(RUN_FORMAL_ANALYSIS and USE_TEMPORAL_BODY_RECOVERY)
     TEMPORAL_SKIP_EDGE_FRAMES = 3
     TEMPORAL_WINDOW = 5
-    TEMPORAL_MIN_HITS = 4
-    TEMPORAL_CHROMA_MIN = 14
-    TEMPORAL_MIN_CHANNEL = 45
-    TEMPORAL_MAX_VALUE = 235
+    TEMPORAL_MIN_HITS = 3
+    TEMPORAL_CHROMA_MIN = 9
+    TEMPORAL_MIN_CHANNEL = 40
+    TEMPORAL_MAX_VALUE = 240
     TEMPORAL_RIM_EXCLUSION_PX = 30
-    TEMPORAL_CONNECT_RADIUS = 6
-    TEMPORAL_MIN_OBJ_SIZE = 20
+    TEMPORAL_CONNECT_RADIUS = 10
+    TEMPORAL_MIN_OBJ_SIZE = 15
+    TEMPORAL_EXTERIOR_ONLY = False
+    TEMPORAL_BLOCK_HOLE_MAX_AREA = 1500
+    TEMPORAL_FINAL_SMOOTH_WINDOW = 5
+    TEMPORAL_FINAL_SMOOTH_MIN_HITS = 3
 
-    if OVERLAY_VALIDATION_MODE:
-        MAX_FRAMES = 1800
-        SAVE_OVERLAY_VIDEO = True
-        OVERLAY_VIDEO_FPS = 30
-        VEIN_EVERY_N_FRAMES = 10
-        COMPUTE_BODY_SKELETON = True
-        COMPUTE_FRONT_SPEED = False
-        RUN_QC_VALIDATION = False
-        RUN_SEGMENT_TESTS = False
-    else:
-        MAX_FRAMES = None
-        SAVE_OVERLAY_VIDEO = False
-        OVERLAY_VIDEO_FPS = 30
-        VEIN_EVERY_N_FRAMES = 5
-        COMPUTE_BODY_SKELETON = True
-        COMPUTE_FRONT_SPEED = True
-        RUN_QC_VALIDATION = True
-        RUN_SEGMENT_TESTS = False
+    # Formal-analysis settings. Test-only modes skip the formal analysis, so
+    # these values only matter when RUN_FORMAL_ANALYSIS is True.
+    MAX_FRAMES = FORMAL_ANALYSIS_MAX_FRAMES
+    SAVE_OVERLAY_VIDEO = True
+    OVERLAY_VIDEO_FPS = 30
+    # One scale controls both formal analysis speed and the formal overlay size.
+    # 1.0 = original resolution; 0.5 = half width/height; 0.25 = quarter width/height.
+    FORMAL_FRAME_SCALE = 0.5
+    OVERLAY_VIDEO_OUTPUT_SCALE = FORMAL_FRAME_SCALE
+    VEIN_EVERY_N_FRAMES = 0  # Disable separate vein/ridge analysis for HSV body-mask comparison.
+    COMPUTE_BODY_SKELETON = True
+    COMPUTE_FRONT_SPEED = True
+    RUN_QC_VALIDATION = bool(RUN_FORMAL_ANALYSIS)
+    RUN_SEGMENT_TESTS = False
 
     print("Run configuration:")
-    print(f"  OVERLAY_VALIDATION_MODE = {OVERLAY_VALIDATION_MODE}")
+    print("  MODE = HSV body-mask analysis")
+    print(f"  RUN_MODE = {RUN_MODE}")
+    print(f"  RUN_FORMAL_ANALYSIS = {RUN_FORMAL_ANALYSIS}")
+    print(f"  RUN_TEST_CLIPS = {RUN_TEST_CLIPS}")
+    print(f"  TEST_ONLY_MODE = {TEST_ONLY_MODE}")
+    print(f"  FORMAL_ANALYSIS_MAX_TIME_SEC = {FORMAL_ANALYSIS_MAX_TIME_SEC}")
+    print(f"  FORMAL_ANALYSIS_MAX_FRAMES = {FORMAL_ANALYSIS_MAX_FRAMES}")
     print(f"  MAX_FRAMES = {MAX_FRAMES}")
+    print(f"  FORMAL_FRAME_SCALE = {FORMAL_FRAME_SCALE}")
+    print(f"  OVERLAY_VIDEO_OUTPUT_SCALE = {OVERLAY_VIDEO_OUTPUT_SCALE}")
     print(f"  SAVE_OVERLAY_VIDEO = {SAVE_OVERLAY_VIDEO}")
     print(f"  VEIN_EVERY_N_FRAMES = {VEIN_EVERY_N_FRAMES}")
     print(f"  COMPUTE_BODY_SKELETON = {COMPUTE_BODY_SKELETON}")
@@ -4952,12 +5995,25 @@ if __name__ == "__main__":
     print(f"  VALIDATION_CLIP_BATCH_FRAMES = {VALIDATION_CLIP_BATCH_FRAMES}")
     print(f"  VALIDATION_CLIP_WRITE_VIDEO = {VALIDATION_CLIP_WRITE_VIDEO}")
     print(f"  USE_TEMPORAL_BODY_RECOVERY = {USE_TEMPORAL_BODY_RECOVERY}")
+    print(f"  FORMAL_USE_TEMPORAL_BODY_RECOVERY = {FORMAL_USE_TEMPORAL_BODY_RECOVERY}")
+    print(
+        "  TEMPORAL_SCOPE = "
+        + (
+            "formal_metrics_and_validation"
+            if FORMAL_USE_TEMPORAL_BODY_RECOVERY
+            else "validation_only" if USE_TEMPORAL_BODY_RECOVERY else "off"
+        )
+    )
     print(f"  TEMPORAL_SKIP_EDGE_FRAMES = {TEMPORAL_SKIP_EDGE_FRAMES}")
     print(f"  TEMPORAL_WINDOW = {TEMPORAL_WINDOW}")
     print(f"  TEMPORAL_MIN_HITS = {TEMPORAL_MIN_HITS}")
     print(f"  TEMPORAL_CHROMA_MIN = {TEMPORAL_CHROMA_MIN}")
     print(f"  TEMPORAL_RIM_EXCLUSION_PX = {TEMPORAL_RIM_EXCLUSION_PX}")
     print(f"  TEMPORAL_CONNECT_RADIUS = {TEMPORAL_CONNECT_RADIUS}")
+    print(f"  TEMPORAL_EXTERIOR_ONLY = {TEMPORAL_EXTERIOR_ONLY}")
+    print(f"  TEMPORAL_BLOCK_HOLE_MAX_AREA = {TEMPORAL_BLOCK_HOLE_MAX_AREA}")
+    print(f"  TEMPORAL_FINAL_SMOOTH_WINDOW = {TEMPORAL_FINAL_SMOOTH_WINDOW}")
+    print(f"  TEMPORAL_FINAL_SMOOTH_MIN_HITS = {TEMPORAL_FINAL_SMOOTH_MIN_HITS}")
 
     hsv_params = dict(
         h_min=15,
@@ -4972,7 +6028,7 @@ if __name__ == "__main__":
         # One global parameter set calibrated against 30 front/middle/rear masks.
         # The rear reference masks use AI threshold 0.70 to recover pale branches.
         fill_small_body_holes=False,
-        use_yellow_chroma_extension=True,
+        use_yellow_chroma_extension=False,  # HSV-only: disable RGB/yellow-chroma extension
         yellow_chroma_min=23,
         yellow_chroma_max_value=225,
         yellow_chroma_min_channel=55,
@@ -5044,6 +6100,40 @@ if __name__ == "__main__":
     out_dir = Path(OUTPUT_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    run_mode_indicator = {
+        "run_mode": RUN_MODE,
+        "run_formal_analysis": bool(RUN_FORMAL_ANALYSIS),
+        "run_test_clips": bool(RUN_TEST_CLIPS),
+        "test_only_mode": bool(TEST_ONLY_MODE),
+        "validation_sections": ";".join(VALIDATION_CLIP_SECTIONS),
+        "segmentation_profile": SEGMENTATION_PROFILE,
+        "hsv_only": not bool(FORMAL_USE_TEMPORAL_BODY_RECOVERY),
+        "use_temporal_body_recovery": bool(USE_TEMPORAL_BODY_RECOVERY),
+        "formal_use_temporal_body_recovery": bool(FORMAL_USE_TEMPORAL_BODY_RECOVERY),
+        "temporal_scope": (
+            "formal_metrics_and_validation"
+            if FORMAL_USE_TEMPORAL_BODY_RECOVERY
+            else "validation_only" if USE_TEMPORAL_BODY_RECOVERY else "off"
+        ),
+        "formal_metrics_mask": (
+            "temporal_recovered_hsv_mask"
+            if FORMAL_USE_TEMPORAL_BODY_RECOVERY
+            else "strict_hsv_clean_mask"
+        ),
+        "formal_analysis_max_time_sec": FORMAL_ANALYSIS_MAX_TIME_SEC,
+        "formal_analysis_max_frames": FORMAL_ANALYSIS_MAX_FRAMES,
+        "formal_frame_scale": FORMAL_FRAME_SCALE,
+        "formal_effective_pixel_size": _effective_pixel_size_for_formal_scale(PIXEL_SIZE, FORMAL_FRAME_SCALE),
+        "formal_overlay_video_output_scale": OVERLAY_VIDEO_OUTPUT_SCALE,
+        "use_yellow_chroma_extension": bool(hsv_params.get("use_yellow_chroma_extension", False)),
+        "use_relaxed_body_mask": bool(hsv_params.get("use_relaxed_body_mask", False)),
+    }
+    run_mode_indicator_csv = out_dir / "run_mode_indicator.csv"
+    pd.DataFrame([run_mode_indicator]).to_csv(
+        run_mode_indicator_csv, index=False, encoding="utf-8-sig"
+    )
+    print(f"Saved run mode indicator: {run_mode_indicator_csv}")
+
     if VALIDATION_ONLY_MODE:
         if INPUT_MODE != "video" or SEGMENTATION_PROFILE != "hsv_circle":
             raise ValueError(
@@ -5071,6 +6161,10 @@ if __name__ == "__main__":
                 temporal_rim_exclusion_px=TEMPORAL_RIM_EXCLUSION_PX,
                 temporal_connect_radius=TEMPORAL_CONNECT_RADIUS,
                 temporal_min_obj_size=TEMPORAL_MIN_OBJ_SIZE,
+                temporal_exterior_only=TEMPORAL_EXTERIOR_ONLY,
+                temporal_block_hole_max_area=TEMPORAL_BLOCK_HOLE_MAX_AREA,
+                temporal_final_smooth_window=TEMPORAL_FINAL_SMOOTH_WINDOW,
+                temporal_final_smooth_min_hits=TEMPORAL_FINAL_SMOOTH_MIN_HITS,
                 n_jobs=VALIDATION_CLIP_CPU_WORKERS if ENABLE_CPU_PARALLEL else 1,
                 batch_frames=VALIDATION_CLIP_BATCH_FRAMES,
             )
@@ -5179,7 +6273,45 @@ if __name__ == "__main__":
             overlay_video_path=overlay_video,
             overlay_video_fps=OVERLAY_VIDEO_FPS,
         )
-        if ENABLE_CPU_PARALLEL and LOW_MEMORY_VIDEO_STREAM:
+        if FORMAL_USE_TEMPORAL_BODY_RECOVERY:
+            if SEGMENTATION_PROFILE != "hsv_circle":
+                raise ValueError(
+                    "Formal temporal recovery currently requires SEGMENTATION_PROFILE='hsv_circle'."
+                )
+            df, debug_data, osc = analyze_video_stream_formal_temporal(
+                input_path,
+                dt=FRAME_INTERVAL,
+                pixel_size=PIXEL_SIZE,
+                roi=ROI,
+                max_frames=MAX_FRAMES,
+                debug_frame_indices=debug_indices,
+                dish_center=DISH_CENTER,
+                dish_radius=DISH_RADIUS,
+                hsv_params=hsv_params,
+                vein_params=vein_params,
+                vein_every_n_frames=VEIN_EVERY_N_FRAMES,
+                compute_body_skeleton=COMPUTE_BODY_SKELETON,
+                compute_front_speed=COMPUTE_FRONT_SPEED,
+                analysis_roi=ANALYSIS_ROI,
+                overlay_video_path=overlay_video,
+                overlay_video_fps=OVERLAY_VIDEO_FPS,
+                overlay_video_output_scale=OVERLAY_VIDEO_OUTPUT_SCALE,
+                temporal_window=TEMPORAL_WINDOW,
+                temporal_min_hits=TEMPORAL_MIN_HITS,
+                temporal_chroma_min=TEMPORAL_CHROMA_MIN,
+                temporal_min_channel=TEMPORAL_MIN_CHANNEL,
+                temporal_max_value=TEMPORAL_MAX_VALUE,
+                temporal_rim_exclusion_px=TEMPORAL_RIM_EXCLUSION_PX,
+                temporal_connect_radius=TEMPORAL_CONNECT_RADIUS,
+                temporal_min_obj_size=TEMPORAL_MIN_OBJ_SIZE,
+                temporal_exterior_only=TEMPORAL_EXTERIOR_ONLY,
+                temporal_block_hole_max_area=TEMPORAL_BLOCK_HOLE_MAX_AREA,
+                temporal_final_smooth_window=TEMPORAL_FINAL_SMOOTH_WINDOW,
+                temporal_final_smooth_min_hits=TEMPORAL_FINAL_SMOOTH_MIN_HITS,
+                batch_frames=PARALLEL_BATCH_FRAMES,
+                formal_frame_scale=FORMAL_FRAME_SCALE,
+            )
+        elif ENABLE_CPU_PARALLEL and LOW_MEMORY_VIDEO_STREAM:
             df, debug_data, osc = analyze_video_parallel_batches(
                 input_path,
                 **video_analysis_kwargs,
@@ -5192,6 +6324,8 @@ if __name__ == "__main__":
                 **video_analysis_kwargs,
             )
         print(f"Analyzed {len(df)} frames.")
+        if overlay_video is not None:
+            print(f"Saved overlay video: {overlay_video}")
     else:
         if INPUT_MODE == "folder":
             frames, names = load_frames_from_folder(input_path, as_gray=load_as_gray)
@@ -5205,26 +6339,61 @@ if __name__ == "__main__":
 
         print(f"Loaded {len(frames)} frames.")
 
-        df, debug_data, osc = analyze_timelapse(
-            frames,
-            names=names,
-            dt=FRAME_INTERVAL,
-            pixel_size=PIXEL_SIZE,
-            roi=ROI,
-            analysis_roi=ANALYSIS_ROI,
-            segmentation_profile=SEGMENTATION_PROFILE,
-            dish_center=DISH_CENTER,
-            dish_radius=DISH_RADIUS,
-            hsv_params=hsv_params,
-            vein_params=vein_params,
-            vein_every_n_frames=VEIN_EVERY_N_FRAMES,
-            compute_body_skeleton=COMPUTE_BODY_SKELETON,
-            compute_front_speed=COMPUTE_FRONT_SPEED,
-            preprocess_params=preprocess_params,
-            segment_params=segment_params,
-            keep_debug=True,
-            n_jobs=CPU_WORKERS if ENABLE_CPU_PARALLEL else 1,
-        )
+        if FORMAL_USE_TEMPORAL_BODY_RECOVERY:
+            if SEGMENTATION_PROFILE != "hsv_circle":
+                raise ValueError(
+                    "Formal temporal recovery currently requires SEGMENTATION_PROFILE='hsv_circle'."
+                )
+            df, debug_data, osc = analyze_timelapse_formal_temporal(
+                frames,
+                names=names,
+                dt=FRAME_INTERVAL,
+                pixel_size=PIXEL_SIZE,
+                roi=ROI,
+                analysis_roi=ANALYSIS_ROI,
+                dish_center=DISH_CENTER,
+                dish_radius=DISH_RADIUS,
+                hsv_params=hsv_params,
+                vein_params=vein_params,
+                vein_every_n_frames=VEIN_EVERY_N_FRAMES,
+                compute_body_skeleton=COMPUTE_BODY_SKELETON,
+                compute_front_speed=COMPUTE_FRONT_SPEED,
+                keep_debug=True,
+                temporal_window=TEMPORAL_WINDOW,
+                temporal_min_hits=TEMPORAL_MIN_HITS,
+                temporal_chroma_min=TEMPORAL_CHROMA_MIN,
+                temporal_min_channel=TEMPORAL_MIN_CHANNEL,
+                temporal_max_value=TEMPORAL_MAX_VALUE,
+                temporal_rim_exclusion_px=TEMPORAL_RIM_EXCLUSION_PX,
+                temporal_connect_radius=TEMPORAL_CONNECT_RADIUS,
+                temporal_min_obj_size=TEMPORAL_MIN_OBJ_SIZE,
+                temporal_exterior_only=TEMPORAL_EXTERIOR_ONLY,
+                temporal_block_hole_max_area=TEMPORAL_BLOCK_HOLE_MAX_AREA,
+                temporal_final_smooth_window=TEMPORAL_FINAL_SMOOTH_WINDOW,
+                temporal_final_smooth_min_hits=TEMPORAL_FINAL_SMOOTH_MIN_HITS,
+                formal_frame_scale=FORMAL_FRAME_SCALE,
+            )
+        else:
+            df, debug_data, osc = analyze_timelapse(
+                frames,
+                names=names,
+                dt=FRAME_INTERVAL,
+                pixel_size=PIXEL_SIZE,
+                roi=ROI,
+                analysis_roi=ANALYSIS_ROI,
+                segmentation_profile=SEGMENTATION_PROFILE,
+                dish_center=DISH_CENTER,
+                dish_radius=DISH_RADIUS,
+                hsv_params=hsv_params,
+                vein_params=vein_params,
+                vein_every_n_frames=VEIN_EVERY_N_FRAMES,
+                compute_body_skeleton=COMPUTE_BODY_SKELETON,
+                compute_front_speed=COMPUTE_FRONT_SPEED,
+                preprocess_params=preprocess_params,
+                segment_params=segment_params,
+                keep_debug=True,
+                n_jobs=CPU_WORKERS if ENABLE_CPU_PARALLEL else 1,
+            )
         del frames, names
         gc.collect()
 
@@ -5234,8 +6403,30 @@ if __name__ == "__main__":
                 debug_data,
                 overlay_video,
                 fps=OVERLAY_VIDEO_FPS,
+                output_scale=(1.0 if FORMAL_USE_TEMPORAL_BODY_RECOVERY and FORMAL_FRAME_SCALE < 0.999 else OVERLAY_VIDEO_OUTPUT_SCALE),
             )
             print(f"Saved overlay video: {overlay_video}")
+
+    if "run_mode" not in df.columns:
+        df.insert(0, "run_mode", RUN_MODE)
+    if "run_formal_analysis" not in df.columns:
+        df.insert(1, "run_formal_analysis", bool(RUN_FORMAL_ANALYSIS))
+    if "validation_sections" not in df.columns:
+        df.insert(2, "validation_sections", ";".join(VALIDATION_CLIP_SECTIONS))
+    if "formal_use_temporal_body_recovery" not in df.columns:
+        df.insert(3, "formal_use_temporal_body_recovery", bool(FORMAL_USE_TEMPORAL_BODY_RECOVERY))
+    if "formal_frame_scale" not in df.columns:
+        df.insert(4, "formal_frame_scale", FORMAL_FRAME_SCALE)
+    if "formal_effective_pixel_size" not in df.columns:
+        df.insert(5, "formal_effective_pixel_size", _effective_pixel_size_for_formal_scale(PIXEL_SIZE, FORMAL_FRAME_SCALE))
+    if "formal_metrics_mask" not in df.columns:
+        df.insert(
+            4,
+            "formal_metrics_mask",
+            "temporal_recovered_hsv_mask"
+            if FORMAL_USE_TEMPORAL_BODY_RECOVERY
+            else "strict_hsv_clean_mask",
+        )
 
     metrics_csv = out_dir / "plasmodium_metrics.csv"
     df.to_csv(metrics_csv, index=False, encoding="utf-8-sig")
@@ -5264,6 +6455,12 @@ if __name__ == "__main__":
                     temporal_rim_exclusion_px=TEMPORAL_RIM_EXCLUSION_PX,
                     temporal_connect_radius=TEMPORAL_CONNECT_RADIUS,
                     temporal_min_obj_size=TEMPORAL_MIN_OBJ_SIZE,
+                    temporal_exterior_only=TEMPORAL_EXTERIOR_ONLY,
+                    temporal_block_hole_max_area=TEMPORAL_BLOCK_HOLE_MAX_AREA,
+                    temporal_final_smooth_window=TEMPORAL_FINAL_SMOOTH_WINDOW,
+                    temporal_final_smooth_min_hits=TEMPORAL_FINAL_SMOOTH_MIN_HITS,
+                    n_jobs=VALIDATION_CLIP_CPU_WORKERS if ENABLE_CPU_PARALLEL else 1,
+                    batch_frames=VALIDATION_CLIP_BATCH_FRAMES,
                 )
             else:
                 save_lightweight_validation_clips(
@@ -5341,6 +6538,8 @@ if __name__ == "__main__":
             )
 
     summary_df = summarize_run(df, label=input_path.stem)
+    summary_df.insert(0, "run_mode", RUN_MODE)
+    summary_df.insert(1, "validation_sections", ";".join(VALIDATION_CLIP_SECTIONS))
     summary_df["osc_dominant_freq"] = osc.get("dominant_freq", np.nan)
     summary_df["osc_period"] = osc.get("period", np.nan)
     summary_df["osc_n_peaks"] = osc.get("n_peaks", 0)
@@ -5349,8 +6548,3 @@ if __name__ == "__main__":
     summary_df.to_csv(summary_csv, index=False, encoding="utf-8-sig")
     print(f"Saved summary CSV: {summary_csv}")
     print(summary_df.to_string(index=False))
-
-
-
-
-

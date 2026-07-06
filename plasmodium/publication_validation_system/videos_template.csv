@@ -1,0 +1,2 @@
+video_id,video_path,dataset_role,biological_replicate,condition,acquisition_date,dish_center_x,dish_center_y,dish_radius,pixel_size,frame_interval_s
+output2_development,C:\Users\chen8\Pictures\研究\實驗圖\年菌\output2.mp4,development,dev_culture_01,development_only,,1280,960,750,1.0,10.0

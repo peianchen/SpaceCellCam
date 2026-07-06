@@ -53,7 +53,7 @@
 #define CAPTURE_RESTORE_SETTLE_MS 50 // AF 從 QVGA 切回 QSXGA 後，先讓 sensor/JPEG 穩定
 #define CAPTURE_DISCARD_FRAMES 1     // 正式拍照前丟幾幀；2 較穩但 LED 會多亮約 1~3 秒
 #define LED_PREHEAT_MS    300        // LED 預熱
-#define LED_BRIGHTNESS    60         // LED 亮度（0~255）
+#define LED_BRIGHTNESS    100         // LED 亮度（0~255）
 #define STATUS_LED_BRIGHTNESS 100     // 不接Serial時用補光LED顯示狀態
 #define ENABLE_DEBUG_LOG  1          // 1=印出詳細 debug log；0=只保留必要訊息
 #define ENABLE_DEBUG_MATE_LOG 1      // 1=Serial1/Debug Mate 顯示短狀態；USB CDC 仍顯示完整 log
@@ -70,7 +70,7 @@
 #define AF_LED_PREHEAT_MS 50         // AF 補光預熱，獨立於正式拍照補光
 #define AF_LED_BRIGHTNESS 24         // AF 補光亮度，降低對樣本的影響
 #define AF_SETUP_SETTLE_MS 800       // setup single AF 最多等待時間
-#define AF_CAPTURE_SETTLE_MS 2500    // 每張 AF 最多等待時間；AF pump 先降 QVGA
+#define AF_CAPTURE_SETTLE_MS 3500    // 每張 AF 最多等待時間；AF pump 先降 QVGA
 #define AF_PUMP_FRAME_SIZE FRAMESIZE_QVGA
 #define AF_SWITCH_FRAME_SIZE_FOR_PUMP 1 // 1=AF pump 先切 QVGA，加快對焦；拍照前切回 QSXGA
 #define AF_PUMP_FRAME_COUNT 5        // AF 時快速出幾張低解析度 frame 讓韌體判斷
