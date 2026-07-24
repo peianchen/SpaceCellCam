@@ -53,8 +53,8 @@
 #define CAPTURE_RESTORE_SETTLE_MS 50 // AF 從 QVGA 切回 QSXGA 後，先讓 sensor/JPEG 穩定
 #define CAPTURE_DISCARD_FRAMES 1     // 正式拍照前丟幾幀；2 較穩但 LED 會多亮約 1~3 秒
 #define LED_PREHEAT_MS    300        // LED 預熱
-#define LED_BRIGHTNESS    100         // LED 亮度（0~255）
-#define STATUS_LED_BRIGHTNESS 100     // 不接Serial時用補光LED顯示狀態
+#define LED_BRIGHTNESS    150         // LED 亮度（0~255）
+#define STATUS_LED_BRIGHTNESS 150     // 不接Serial時用補光LED顯示狀態
 #define ENABLE_DEBUG_LOG  1          // 1=印出詳細 debug log；0=只保留必要訊息
 #define ENABLE_DEBUG_MATE_LOG 1      // 1=Serial1/Debug Mate 顯示短狀態；USB CDC 仍顯示完整 log
 #define ENABLE_CAMERA_LIFECYCLE_DEBUG 1 // 1=記錄 fb_get/return、記憶體、溫度、standby 狀態
@@ -65,8 +65,8 @@
 #define SENSOR_WAKE_SETTLE_MS 120    // 從 standby 喚醒後等待時間
 #define AF_DEBUG_WAIT_LOG 0          // 1=印 AF wait/pump 細節；0=關閉，避免 Serial 輸出拖慢 AF
 #define AF_DEBUG_EVERY_POLL 0        // 1=每次 AF 輪詢都印 status，只有 AF_DEBUG_WAIT_LOG=1 時有效
-#define ENABLE_AUTOFOCUS  1          // 只在 OV5640 + AF 模組時生效
-#define AF_LOCK_MODE      3          // 0=關AF  1=setup後stop鎖焦  2=setup後release  3=拍照時中心single AF/reuse lock
+#define ENABLE_AUTOFOCUS  0          // 只在 OV5640 + AF 模組時生效
+#define AF_LOCK_MODE      0          // 0=關AF  1=setup後stop鎖焦  2=setup後release  3=拍照時中心single AF/reuse lock
 #define AF_LED_PREHEAT_MS 50         // AF 補光預熱，獨立於正式拍照補光
 #define AF_LED_BRIGHTNESS 24         // AF 補光亮度，降低對樣本的影響
 #define AF_SETUP_SETTLE_MS 800       // setup single AF 最多等待時間
@@ -74,7 +74,7 @@
 #define AF_PUMP_FRAME_SIZE FRAMESIZE_QVGA
 #define AF_SWITCH_FRAME_SIZE_FOR_PUMP 1 // 1=AF pump 先切 QVGA，加快對焦；拍照前切回 QSXGA
 #define AF_PUMP_FRAME_COUNT 5        // AF 時快速出幾張低解析度 frame 讓韌體判斷
-#define AF_KEEP_LOCK_AFTER_CAPTURE 1 // 0=每張拍完 release，下張重新AF；1=成功後不release，後續reuse lock
+#define AF_KEEP_LOCK_AFTER_CAPTURE 0 // 0=每張拍完 release，下張重新AF；1=成功後不release，後續reuse lock
 #define AF_REFOCUS_EVERY_N 0         // 0=成功後不週期重對焦；>0=每 N 張重對焦一次
 #define AF_POLL_MS        25         // AF 狀態輪詢間隔
 #define AF_STABLE_COUNT   1          // 連續幾次 focused 才視為已對焦
