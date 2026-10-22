@@ -1,5 +1,7 @@
 # SpaceCellCam
 
+[工程說明](docs/ENGINEERING.zh-TW.md) · [Engineering notes](docs/ENGINEERING.md) · [Project website](https://peianchen.github.io/peian-chen/en/projects/spacecellcam/)
+
 Firmware for Seeed Studio XIAO ESP32S3 + OV5640 AF camera. It captures LED-assisted QSXGA JPEG images to microSD every 10 seconds.
 
 Open `project_overview.html` for an interactive overview.
@@ -211,7 +213,7 @@ Unstable USB power can cause frame timeouts, corrupted images, long discard time
 ## Build
 
 ```powershell
-C:\Users\chen8\.platformio\penv\Scripts\pio.exe run
+pio run
 ```
 
 Target:
