@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pytest_tmp/
+tests/_smoke_output/
+runs/
+ui_settings.json
+
+publication_runs/
+publication_validation_system/_synthetic_smoke_workspace/

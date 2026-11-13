@@ -1,3 +1,56 @@
 # Local presentation artifacts
 *.ppt
 *.pptx
+
+# Local planning, generated slides, caches and scratch workspaces
+.planning/
+.codex_ppt_preview/
+.ppt_tmp_*/
+pptx_build_*/
+*.inspect.ndjson
+.pytest_cache/
+.pytest_tmp/
+pytest-cache-files-*/
+__pycache__/
+*.py[cod]
+*_tmp/
+tmp_*/
+test_tmp_*/
+*_smoke/
+*_smoke_test/
+mask_diagnostics_*/
+video_diagnostics_*/
+mask_parameter_sweep_*/
+vesselness_recovery_sweep_output/
+/mask_parameter_sweep_combined_summary.csv
+/rear_*.jpg
+results_*/
+param_sweep_*/
+segment_tests_*/
+
+# Raw/derived research media and large model artifacts stay local
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.gif
+*.npy
+*.npz
+*.pt
+*.pth
+raw_data/
+experiment_data/
+build/
+dist/
+.venv*/
+
+# Machine-specific inputs; publish portable examples instead
+plasmodium_analysis_v2/user_config.py
+plasmodium_analysis_v2/ui_settings.json
+ai_segmentation_pilot/pilot_config.json
+ai_segmentation_pilot/dataset/
+ai_segmentation_pilot/checkpoints/
+videos.csv
+*.local.json
+_synthetic_smoke_workspace/
+_contraction_smoke_output/

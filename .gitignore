@@ -14,10 +14,9 @@ plasmodium/segment_tests_*/
 plasmodium/segment_tests_output*/
 
 # Plasmodium local validation and tuning artifacts
-plasmodium/plasmodium_brightfield_analysis_relaxed_parallel_validation.py
-plasmodium/prepare_draft_masks.py
-plasmodium/redraw_rear_masks_from_manual.py
-plasmodium/run_manual_mask_validation.py
-plasmodium/test_temporal_body_recovery.py
-plasmodium/tune_global_hsv_parameters.py
 plasmodium/rear_*.jpg
+
+# Local agent settings and caches (preserved on disk)
+.agents/
+.codex/
+.claude/

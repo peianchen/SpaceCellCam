@@ -1,0 +1,22 @@
+{
+  "video_groups": {
+    "still": "PATH_TO_STILL_VIDEOS",
+    "rotating": "PATH_TO_ROTATING_VIDEOS"
+  },
+  "dataset_root": "dataset",
+  "dish_center": [1280, 920],
+  "dish_radius": 680,
+  "frames_per_section": 5,
+  "sections": {
+    "early": [0.05, 0.30],
+    "middle": [0.35, 0.65],
+    "late": [0.70, 0.95]
+  },
+  "registration": {
+    "enabled": true,
+    "max_dimension": 720,
+    "max_translation_px": 35.0,
+    "max_rotation_deg": 2.0,
+    "min_ecc_score": 0.35
+  }
+}

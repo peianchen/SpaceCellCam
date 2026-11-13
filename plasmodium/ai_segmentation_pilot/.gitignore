@@ -1,0 +1,11 @@
+.venv_ai/
+_tmp_ai*/
+checkpoints/
+dataset/images/
+dataset/masks_draft/
+dataset/masks_verified/
+dataset/draft_overlays/
+dataset/masks_weak_v2/
+dataset/weak_v2_overlays/
+__pycache__/
+*.pyc

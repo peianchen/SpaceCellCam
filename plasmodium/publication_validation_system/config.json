@@ -3,7 +3,11 @@
   "random_seed": 20260701,
   "output_root": "../results_plasmodium/publication_validation",
   "sampling": {
-    "phases": ["front", "middle", "rear"],
+    "phases": [
+      "front",
+      "middle",
+      "rear"
+    ],
     "windows_per_phase": 2,
     "frames_per_window": 5,
     "edge_exclusion_frames": 4,
@@ -11,13 +15,19 @@
     "repeat_annotation_fraction": 0.2
   },
   "annotation": {
-    "annotators": ["annotator_A", "annotator_B"],
-    "repeat_annotators": ["annotator_A", "annotator_B"],
+    "annotators": [
+      "annotator_A",
+      "annotator_B"
+    ],
+    "repeat_annotators": [
+      "annotator_A",
+      "annotator_B"
+    ],
     "require_adjudicated_consensus": true
   },
   "algorithm": {
     "status": "development_not_frozen",
-    "source_file": "../plasmodium_brightfield_analysis.py",
+    "source_file": "../plasmodium_brightfield_analysis_optimized.py",
     "prediction_runner_file": "generate_predictions.py",
     "locked_source_sha256": null,
     "locked_prediction_runner_sha256": null,
@@ -55,21 +65,33 @@
       "relaxed_v_min": 35,
       "relaxed_connect_radius": 30,
       "relaxed_min_obj_size": 50,
-      "rim_exclusion_px": 40
+      "rim_exclusion_px": 40,
+      "use_vesselness_recovery": true,
+      "vesselness_percentile": 95.0,
+      "vesselness_min_response": 0.008,
+      "vesselness_connect_radius": 12,
+      "vesselness_min_obj_size": 20,
+      "vesselness_max_added_fraction": 0.02,
+      "vesselness_chroma_min": 4,
+      "vesselness_min_channel": 28,
+      "vesselness_max_value": 245,
+      "vesselness_sigma_min": 1.0,
+      "vesselness_sigma_max": 4.0,
+      "vesselness_black_ridges": false
     },
     "temporal_params": {
       "window": 5,
-      "min_hits": 3,
-      "chroma_min": 9,
-      "min_channel": 40,
+      "min_hits": 4,
+      "chroma_min": 10,
+      "min_channel": 35,
       "max_value": 240,
       "rim_exclusion_px": 30,
-      "connect_radius": 10,
-      "min_obj_size": 15,
-      "exterior_only": false,
-      "block_hole_max_area": 1500,
-      "final_smooth_window": 5,
-      "final_smooth_min_hits": 3
+      "connect_radius": 8,
+      "min_obj_size": 20,
+      "exterior_only": true,
+      "block_hole_max_area": 0,
+      "final_smooth_window": 1,
+      "final_smooth_min_hits": 1
     }
   },
   "evaluation": {

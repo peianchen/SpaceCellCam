@@ -1,0 +1,7 @@
+# Install in the pilot-only environment, not in the existing lbr environment.
+torch>=2.5.1
+torchvision>=0.20.1
+opencv-python>=4.10
+scipy>=1.14
+scikit-image>=0.26
+git+https://github.com/facebookresearch/sam2.git

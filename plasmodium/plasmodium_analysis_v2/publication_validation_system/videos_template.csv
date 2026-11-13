@@ -1,0 +1,2 @@
+video_id,video_path,dataset_role,biological_replicate,condition,acquisition_date,dish_center_x,dish_center_y,dish_radius,pixel_size,frame_interval_s
+example_development,PATH_TO_YOUR_VIDEO.mp4,development,example_culture_01,development_only,,1280,920,680,1.0,10.0

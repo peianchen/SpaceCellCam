@@ -6,6 +6,21 @@ Firmware for Seeed Studio XIAO ESP32S3 + OV5640 AF camera. It captures LED-assis
 
 Open `project_overview.html` for an interactive overview.
 
+## 實驗與影像分析入口（2026-11-14）
+
+本儲存庫包含相機韌體與從 SD 影像到分析／驗證的程式。後續分析與開發以模組化 V2 為主；既有檔案路徑保留。
+
+| 工作 | 入口 |
+|---|---|
+| 完整實驗資料處理順序 | [目前流程](plasmodium/docs/CURRENT_WORKFLOW.md) |
+| 程式與版本分類 | [影像分析首頁](plasmodium/README.md) |
+| 照片整理、影片與展示副本 | [影片工具](plasmodium/video_tools/README.md) |
+| 模組化分析介面 | [V2 使用說明](plasmodium/plasmodium_analysis_v2/README.md) |
+| 開發、測試與已知缺口 | [開發指南](plasmodium/docs/DEVELOPMENT.md) |
+| Git 納入／本機資料界線 | [資料與版本管理](plasmodium/docs/REPOSITORY_POLICY.md) |
+
+原始影片、實驗輸出、AI 模型、暫存與本機輸入設定不放入 Git；請另行備份。設定範例中的時間、培養皿幾何和尺度須依每次實驗確認。程式測試通過不代表分割準確度、菌種鑑定或太空環境驗證完成。
+
 ## Current Mode
 
 Current firmware uses a focus-lock reuse mode with sensor standby:

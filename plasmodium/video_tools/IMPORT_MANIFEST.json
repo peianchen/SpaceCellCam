@@ -1,0 +1,67 @@
+{
+  "imported_on": "2026-11-13",
+  "source_directory": "C:\\Users\\chen8\\OneDrive\\博士\\太空生醫\\video",
+  "policy": "Copy only Python sources and PyInstaller specs; preserve original bytes and leave videos/build/dist at source.",
+  "files": [
+    {
+      "file": "flatten_buckets_gui.py",
+      "bytes": 11551,
+      "sha256": "fb360a87e852561f9014a98ef9c117dc21ead8d468cf5b762fa186abac38e3d4",
+      "source_modified_utc": "2025-10-30T14:47:48.0847277Z"
+    },
+    {
+      "file": "flatten_buckets_gui.spec",
+      "bytes": 1155,
+      "sha256": "dc79b874ce3f1ef5b8919acbddc87f884d6df08ad0780474fcc94cfc29c8cb06",
+      "source_modified_utc": "2025-11-03T07:30:29.6192835Z"
+    },
+    {
+      "file": "images_to_video_gui_1.py",
+      "bytes": 21646,
+      "sha256": "0bfdd244d557da7cddb5634f030523dcf7fd3836c80ca5578dd430def0784557",
+      "source_modified_utc": "2026-03-04T08:59:33.7344686Z"
+    },
+    {
+      "file": "images_to_video_gui_2.py",
+      "bytes": 25813,
+      "sha256": "fbe501ea756400649adff560c99d6fd9082e615f458a12ed2a066260669f5274",
+      "source_modified_utc": "2026-03-23T09:03:25.4076421Z"
+    },
+    {
+      "file": "images_to_video_gui.py",
+      "bytes": 18467,
+      "sha256": "e7bd02a4455cc551037304e02448f1810b16b34233c9f1e4c19b354abe47d71a",
+      "source_modified_utc": "2025-11-03T07:03:56.3241119Z"
+    },
+    {
+      "file": "images_to_video_gui.spec",
+      "bytes": 1155,
+      "sha256": "a8ea1ea60b68ab93436ced303ddd2b87c981d0983a6bbb9184fe6b0a6efd7a16",
+      "source_modified_utc": "2025-11-03T07:17:12.8417528Z"
+    },
+    {
+      "file": "mp4_compress.py",
+      "bytes": 4805,
+      "sha256": "aaff9af903d988c3b14c4013f25cb4237a606d7f750d13d77926ce5c4e8b8dd1",
+      "source_modified_utc": "2025-10-18T07:58:48.9390466Z"
+    },
+    {
+      "file": "video_timescaler_gui.py",
+      "bytes": 16402,
+      "sha256": "3d1540683535e96768689e4e6bde37c983e49474e0e7ec953847f8d320815697",
+      "source_modified_utc": "2025-11-22T03:15:31.9059586Z"
+    },
+    {
+      "file": "video_timescaler_gui.spec",
+      "bytes": 862,
+      "sha256": "390c7d242c0baae3f04718c6da6b8f4a734076be060433746b3c3c600f7d7e58",
+      "source_modified_utc": "2025-11-22T03:32:33.5864709Z"
+    },
+    {
+      "file": "video_to_gif.py",
+      "bytes": 4665,
+      "sha256": "7919eb32b02cab77993708370b0db8835f4c7743c0ffbd6b86c922c8df48f479",
+      "source_modified_utc": "2025-10-18T08:05:43.1459000Z"
+    }
+  ]
+}
