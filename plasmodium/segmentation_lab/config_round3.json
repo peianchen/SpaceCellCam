@@ -1,0 +1,16 @@
+{
+  "line_floor": 0.0045,
+  "line_noise_multiplier": 0.8,
+  "local_floor": 0.005,
+  "local_noise_multiplier": 1.0,
+  "seed_floor": 0.007,
+  "orientation_selectivity": 0.12,
+  "min_component_px": 20,
+  "min_seed_px": 5,
+  "min_span_px": 28,
+  "isolated_span_px": 48,
+  "isolated_elongation": 3.0,
+  "glare_gray": 150,
+  "glare_saturation": 65,
+  "glare_radial_fraction": 0.82
+}

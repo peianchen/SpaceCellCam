@@ -1,0 +1,21 @@
+{
+  "baseline_commit": "923afef",
+  "branch": "codex/segmentation-r3-20261118",
+  "status": "review_required_candidate_not_formal_quantification",
+  "synthetic_software_tests_passed": 166,
+  "real_segmentation_frames": 40,
+  "previous_frames_replayed": 32,
+  "new_timepoints_same_videos": 8,
+  "motion_pairs_development": 28,
+  "motion_pairs_new_windows": 14,
+  "confirmed_segmentation_ground_truth": 0,
+  "biological_plane_correction_verified": false,
+  "source_sha256": {
+    "segmenter_round3.py": "4b43b40b1ad73620dd83b12c4eca59e908208547ce00447e4551b88899450cec",
+    "registration_v3.py": "08465ac8f42e2392174ca548258b322fa76c33986661d9600fe1607576bc19ae",
+    "round3_benchmark.py": "81a4d26d99472bb449604ca08cbdc59bd2a70545134f1e99e79de5b82cd94d04",
+    "round3_sequence.py": "61c031ed087a2a068704c635288b207ad36105328db1820fdf220bbd819cf8bc",
+    "config_round3.json": "3603dff5b910f2bf72819884f63db2f0aab0ce9db601c5fddb464272585538bb"
+  },
+  "result_storage": "Local outputs only; raw data and research artifacts excluded from Git."
+}
