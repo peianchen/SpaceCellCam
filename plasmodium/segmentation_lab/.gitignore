@@ -1,0 +1,17 @@
+outputs/
+snapshots/
+__pycache__/
+.pytest_cache/
+*.pyc
+
+# Experiment-specific geometry, detailed records and local result viewers.
+# Source code, generic algorithm settings and milestone summaries are versioned.
+config_round1.json
+config_round1_v2.json
+*.local.json
+README_ROUND1_LOCAL.md
+ROUND1_REPORT_20261118.md
+ROUND2_REPORT_20261118.md
+ROUND2_VALIDATION_DESIGN.md
+ROUND2_VISUAL_REVIEW.md
+ROUND2_RESULTS.html

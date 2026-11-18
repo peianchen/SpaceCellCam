@@ -1,0 +1,8 @@
+{
+  "geometry_note": "Illustrative geometry for a 2560x1920 image, not a calibration. Replace center/radius and video ID after inspecting the real culture area. All units are original image pixels.",
+  "roi": {"center": [1280, 960], "radius": 650, "margin_px": 10},
+  "new_method_roi_by_video": {
+    "example_video": {"center": [1280, 960], "radius": 650}
+  },
+  "methods": {"adaptive_chroma": {"refine_roi": true}}
+}

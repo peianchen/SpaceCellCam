@@ -1,6 +1,6 @@
 # 黏菌影像處理與分析
 
-更新：2026-11-14。這裡是 SpaceCellCam 的影像整理、V2 分析、人工驗證與 AI 標註試驗區。
+更新：2026-11-18。這裡是 SpaceCellCam 的影像整理、V2 分析、人工驗證與 AI 標註試驗區。
 目前建議的分析／開發入口是 **`plasmodium_analysis_v2/run_ui.py`**。
 
 ## 從哪裡開始
@@ -8,6 +8,7 @@
 1. 先讀 [完整處理流程](docs/CURRENT_WORKFLOW.md)：取像紀錄、SD 備份、照片排序、影片製作、抽樣檢查、全片分析與人工驗證。
 2. 依 [V2 操作說明](plasmodium_analysis_v2/README.md) 啟動介面。全新下載專案後，先把 `user_config.example.py` 複製為 `user_config.py`，再設定自己的影片路徑及校正值。
 3. 改程式前讀 [開發指南](docs/DEVELOPMENT.md)；資料保存與 Git 範圍見 [版本管理規則](docs/REPOSITORY_POLICY.md)。
+4. 暗光細網與 RPM 震動的新候選方法見 [segmentation_lab](segmentation_lab/README.md) 與 [第二輪版本摘要](segmentation_lab/milestones/20261118-round2.md)。該工具可獨立測試；目前尚未接管 V2 的正式量測。
 
 ## 目前程式分類
 
@@ -17,6 +18,7 @@
 | 現行主線 | [plasmodium_analysis_v2](plasmodium_analysis_v2/README.md) | PyQt 操作、分批分析、結果紀錄、人工工作包 |
 | V2 發表驗證 | [V2 publication_validation_system](plasmodium_analysis_v2/publication_validation_system/README.md) | 獨立抽樣／凍結／預測／評估；目前仍為 development_not_frozen |
 | AI 標註試驗 | [ai_segmentation_pilot](ai_segmentation_pilot/README.md) | 配準、按影片分組、SAM2 草稿／V2 弱標註；未接入主線，未建立專用模型訓練完成證據 |
+| 分割與震動改善候選 | [segmentation_lab](segmentation_lab/README.md) | 局部細網、食物排除、獨立分割測試與保守配準；尚無人工真值準確率 |
 | 舊版發表驗證 | [publication_validation_system](publication_validation_system/README.md) | 對應根目錄 optimized 單檔；不要與 V2 的輸出包混用 |
 | 舊整合單檔 | `plasmodium_brightfield_analysis_optimized.py` | 保留以重現歷史工作；操作紀錄見 [歷史說明](docs/LEGACY_OPTIMIZED_WORKFLOW.md) |
 | 其他歷史版本 | `plasmodium_brightfield_analysis*.py`、`plasmodium_sample*.py` | 不自動取代 V2；名稱含 formal／complete／optimized 不等於已通過科學驗證 |

@@ -1,0 +1,11 @@
+{
+  "noise_floor": 0.003,
+  "noise_tile_px": 64,
+  "contrast_floor": 0.018,
+  "contrast_noise_multiplier": 2.5,
+  "ridge_floor": 0.008,
+  "ridge_noise_multiplier": 1.8,
+  "min_component_px": 24,
+  "min_seed_px": 5,
+  "min_branch_span_px": 20
+}

@@ -1,0 +1,50 @@
+{
+  "milestone": "plasmodium-segmentation-r2-20261118",
+  "status": "candidate_requires_human_validation",
+  "date": "2026-11-18",
+  "scope": "algorithm_and_repeatability_evidence_not_biological_accuracy",
+  "summary": {
+    "comparison_sample_count": 32,
+    "new_prespecified_frames": 8,
+    "new_frame_source_video_count": 4,
+    "old_baseline_replays_equal": 24,
+    "final_replay_verified_frames": 32,
+    "software_synthetic_tests_passed": 129,
+    "negative_background_patches": 4,
+    "foreground_on_these_patches": 0,
+    "human_confirmed_ground_truth_count": 0,
+    "accuracy_metrics": null,
+    "motion_probe_pairs": 28,
+    "motion_applied_pairs": 6,
+    "motion_checked_identity_pairs": 1,
+    "motion_rejected_pairs": 21,
+    "temporal_mask_editing": false,
+    "visual_review_counts_not_accuracy": {
+      "partial_improvement": 3,
+      "nochange": 2,
+      "unclear": 1,
+      "concern": 2
+    }
+  },
+  "raw_media_in_repository": false,
+  "source_sha256": {
+    "__init__.py": "40511dc5dc7d31f5e836ea25de2ff92b5fcb493b18a9c94b53543c2723a4d16f",
+    "annotations.py": "c9db0af387dedd1615c5b9de62f86f4f9fc3fd45e5859459c1195a993c04920a",
+    "baselines.py": "c5e4399c961403fdbd91f1dc7cb3180c0695ac767db4428b7a0fb95811fc1631",
+    "benchmark.py": "3b470bbb6ab67eab35b8a87cfec8441a283b0fb11356e071d80fa3d388d20d1b",
+    "contracts.py": "95cb767639513d36ebf0023e66a3d67a8254061b57b1571aef3322642ecf9c0f",
+    "featured_cases.py": "84088a3c431c329259bcf3b36888e378692340ac21af77043cd50120ab9d0780",
+    "mask_editor.py": "c40804a75150758201301b17f873f125a30f011eea8b5c687b5bdd0861e4df8b",
+    "negative_controls.py": "3e3e1cdca61993cefb61d340d1a84f732bc212278c13c0de4c78fa7b336c649d",
+    "registration_v2.py": "52ae00bdf856e883de5c2bd621a9f17d55d8b4b44b4a9e26d3f4a32e6d442152",
+    "review_figures.py": "20a75572b47c9f0d4550b1bb0d053e1cef8ab1897c1115e8e74718476e8008ed",
+    "round2_benchmark.py": "ab825e5c6d670cf00c8d444b378da0d1d40a91743f6f9b9edb7830e256765e7a",
+    "round2_controls.py": "612093b00d308b9b758fe581ee51d4b8e51875bab80c42f233c56d6586d62eb4",
+    "round2_sequence.py": "20c8397c8b5b5120764df340cab39dbf751a4f4c9f88e16f968679df87cf9969",
+    "segmenter.py": "0d4dc396112edde606a97d8091e2d6cd4767f1a4a2751cf6b4059a657fbd2092",
+    "segmenter_round2.py": "817bd97c37052fca0fddfd6e1b5255a753fdf2235861249b7282fbaf88f5da5a",
+    "temporal_qc.py": "8f13deb9aace69e86beab58349d72d0914f123ebac7fd561dbd2707043f96a13",
+    "verify_round2.py": "20df130d9953cc9997a67246a7ff1c0e8bf0ef692e9a1a6252856f96a04b6fa9",
+    "visualize.py": "d80c85fb04061b47a57b6beb49a45f3fb571373a805c9f6963664aba306c0937"
+  }
+}
